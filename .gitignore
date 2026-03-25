@@ -1,0 +1,11 @@
+checkpoints/
+data/
+visualizations/
+__pycache__/
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+*.out
+*.log
