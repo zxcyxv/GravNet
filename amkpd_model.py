@@ -61,7 +61,6 @@ class AMK_Block(nn.Module):
         d_model        (int)  : 은닉 차원 d
         d_spectral     (int)  : 스펙트럼 특징 차원 D
         dt             (float): Explicit Euler 스텝 사이즈 초기값 (학습 가능)
-        lam            (float): 탄성 입력 주입 강도 초기값 (학습 가능)
         expansion_ratio(int)  : ConvSwiGLU 내부 팽창 비율 m
         conv_kernel_size(int) : Depthwise Conv1D 커널 크기
     """
@@ -71,7 +70,6 @@ class AMK_Block(nn.Module):
         d_model: int,
         d_spectral: int,
         dt: float = 0.1,
-        lam: float = 0.1,
         expansion_ratio: int = 4,
         conv_kernel_size: int = 3,
         use_w_v: bool = False,
@@ -84,7 +82,7 @@ class AMK_Block(nn.Module):
 
         # ── 학습 가능한 스텝 파라미터 ──────────────────────────────────
         self.dt  = nn.Parameter(torch.tensor(float(dt)))   # Δt: scalar
-        self.lam = nn.Parameter(torch.tensor(float(lam)))  # λ : scalar
+        # lam은 블록 내부에서 제거 → AMKPDModel 수준으로 격상됨
 
         # Zero-Initialized Projection (Residual Scale Mismatch 해결)
         self.m_proj = nn.Linear(d_model, d_model)
@@ -138,14 +136,14 @@ class AMK_Block(nn.Module):
         self.log_viz = False
         self.viz_W = []
         self.viz_m = []
+        self.viz_H = []  # H_context = LayerNorm(Q) + X — 실제 중력 작용 공간
 
     # ----------------------------------------------------------
-    def forward(self, Q_in: torch.Tensor, X: torch.Tensor, cos_sin=None) -> torch.Tensor:
+    def forward(self, Q_in: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Q_in : [B, N, d]  현재 은닉 상태
-            X    : [B, N, d]  초기 상태 (탄성 복원에 사용)
-            cos_sin: Tuple[Tensor, Tensor] RoPE용 cos, sin 텐서
+            Q_in : [B, N, d]  현재 은닉 상태 (순수 잔차 누적기)
+            X    : [B, N, d]  입력 정보 안커 (input_norm 통과 후 값)
         Returns:
             Q_out: [B, N, d]  업데이트된 은닉 상태
         """
@@ -159,71 +157,61 @@ class AMK_Block(nn.Module):
         # Pre-Norm 적용
         Q_norm1 = self.norm1(Q_in)                  # [B, N, d]
 
-        # 시퀀스 축(N)에 대해 Mean Pooling → 거시 상태 벡터
-        q_pool = Q_norm1.mean(dim=1)                # [B, d]
+        # 핵심: 정보 공간(Information Space)에서만 X 주입
+        # 누적기 Q에는 직접 더하지 않음 — 노름 폭발 원천 차단
+        H_context = Q_norm1 + X                     # [B, N, d]
+
+        # 시퀀스 축(N)에 대해 Mean Pooling → 거시 상태 벡터 (H_context 기준)
+        q_pool = H_context.mean(dim=1)              # [B, d]
 
         # 하이퍼네트워크 통과 → d×D 행렬로 복원
         Omega_Q = self.hyper_q(q_pool).view(B, d, D)  # [B, d, D]
         Omega_K = self.hyper_k(q_pool).view(B, d, D)  # [B, d, D]
 
-        # =============== RoPE 적용 =========================
-        if cos_sin is not None:
-            cos, sin = cos_sin
-            Q_rotated = apply_rotary_pos_emb(Q_norm1, cos, sin)
-        else:
-            Q_rotated = Q_norm1
-
         # ══════════════════════════════════════════════════════
-        # Step 2: Neural Bochner Spectral Mapping
+        # Step 2: Neural Bochner Spectral Mapping (H_context 기준)
         # ══════════════════════════════════════════════════════
 
-        # Q_rotated @ Omega_Q (상대적 위치 거리가 커널 내적에 반영됨)
-        # B_Q 브로드캐스트 : [D] → [B, N, D]
-        Phi_Q = F.elu(torch.bmm(Q_rotated, Omega_Q) + self.B_Q) + 1.0  # [B, N, D]
-
-        Phi_K = F.elu(torch.bmm(Q_rotated, Omega_K) + self.B_K) + 1.0  # [B, N, D]
+        # X의 앵커 정보를 포함한 커널 사영 (RoPE 제거)
+        Phi_Q = F.elu(torch.bmm(H_context, Omega_Q) + self.B_Q) + 1.0  # [B, N, D]
+        Phi_K = F.elu(torch.bmm(H_context, Omega_K) + self.B_K) + 1.0  # [B, N, D]
 
         # ══════════════════════════════════════════════════════
-        # Step 3: Gravitational Mean Shift & Elastic Input Injection
+        # Step 3: Gravitational Mean Shift (H_context 안커 기준)
         # ══════════════════════════════════════════════════════
 
-        # Value 사영 (옵션 A: 공간 유지, 옵션 B: W_V 공간으로 선형 변환)
+        # V 및 anchor: H_context 공간에서 정의 (X의 안커 역할 내재화)
         if getattr(self, 'use_w_v', False):
-            V = self.W_V(Q_norm1)                   # [B, N, d]
-            anchor = V                              # Mean Shift 시 돌아올 기준점
+            V      = self.W_V(H_context)            # [B, N, d]
+            anchor = V
         else:
-            V = Q_norm1                             # [B, N, d]
-            anchor = Q_norm1
+            V      = H_context                      # [B, N, d]
+            anchor = H_context
 
         # 전역 컨텍스트: C = Phi_K^T @ V
-        # Phi_K^T : [B, D, N],  V : [B, N, d]  →  C : [B, D, d]
         C = torch.bmm(Phi_K.transpose(1, 2), V)     # [B, D, d]
 
         # 인력: Attraction = Phi_Q @ C
-        # [B, N, D] × [B, D, d] = [B, N, d]
         Attraction = torch.bmm(Phi_Q, C)             # [B, N, d]
 
-        # 정규화 항: Norm = Phi_Q @ (Phi_K^T @ 1_N) + ε
-        # Phi_K 열 합산(N 축): [B, D, N] × [B, N, 1] = [B, D, 1] → [B, D]
+        # 정규화 항
         ones_N = torch.ones(B, N, 1, device=Q_in.device, dtype=Q_in.dtype)
         phi_k_sum = torch.bmm(Phi_K.transpose(1, 2), ones_N).squeeze(-1)  # [B, D]
-
-        # [B, N, D] × [B, D, 1] = [B, N, 1] → [B, N]
         denom = torch.bmm(Phi_Q, phi_k_sum.unsqueeze(-1)).squeeze(-1)
-        Norm = denom.abs() + 1.0 # 배경 밀도(Background Density) 1.0 부여 (분모가 0 근처일 때 역전파 기울기 폭발 완벽 차단)
+        Norm = denom.abs() + 1.0
 
-        # Mean Shift 벡터 (Attraction 공간과 뺄셈 앵커 공간 일치화)
+        # Mean Shift 벡터 (H_context 안커 기준)
         m = Attraction / Norm.unsqueeze(-1) - anchor   # [B, N, d]
 
         # Zero-initialized Projection
         m_proj = self.m_proj(m)
-        
-        # Softplus 제약 (Parameter Reparameterization)
-        dt_safe = F.softplus(self.dt)
-        lam_safe = F.softplus(self.lam)
 
-        # 미분 방정식 업데이트 (탄성 포텐셜 포함) (원본 Q_in 에 더해줌으로써 Residual 연결 유지)
-        Q_interact = Q_in + dt_safe * m_proj + lam_safe * (X - Q_in)  # [B, N, d]
+        # Softplus 제약
+        dt_safe = F.softplus(self.dt)
+
+        # 순수 잔차 업데이트 — Q 누적기에는 m_proj만 더함 (X 직접 덧셈 없음)
+        Q_interact = Q_in + dt_safe * m_proj  # [B, N, d]
+
 
         # ── 시각화 캐싱 ──────────────────────────────────────────────────
         if self.log_viz:
@@ -231,6 +219,7 @@ class AMK_Block(nn.Module):
             W_norm = W_raw / Norm.unsqueeze(-1)
             self.viz_W.append(W_norm)
             self.viz_m.append(m)
+            self.viz_H.append(H_context)  # 실제 동역학 개입 공간 캐싱
             
         # ══════════════════════════════════════════════════════
         # Step 4: ConvSwiGLU with Micro-Residual
@@ -280,7 +269,7 @@ class AMKPDModel(nn.Module):
         max_loops      (int)  : 최대 거시 루프 횟수 M
         trunc_loops    (int)  : TBPTL forward-only 구간 N_trunc
         dt             (float): Euler 스텝 초기값 (각 블록이 독립적으로 학습)
-        lam            (float): 탄성 주입 강도 초기값 (각 블록이 독립적으로 학습)
+        lam            (float): 탄성 주입 강도 초기값 (모델 수준 단일 파라미터)
         expansion_ratio(int)  : ConvSwiGLU 팽창 비율 m
         conv_kernel_size(int) : Depthwise Conv 커널 크기
     """
@@ -310,13 +299,14 @@ class AMKPDModel(nn.Module):
         self.max_loops   = max_loops    # M
         self.trunc_loops = trunc_loops  # N_trunc
 
+        # lam 파라미터 제거: X는 이제 블록 내부 정보 공간에서만 작동
+
         # ── 토큰 임베딩 ───────────────────────────────────────────────
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.pos_emb     = nn.Embedding(8192, d_model)  # 1D Absolute Positional Embedding
         self.input_norm  = nn.LayerNorm(d_model)
 
-        # ── RoPE 초기화 ───────────────────────────────────────────────
-        self.rotary_emb = RotaryEmbedding(dim=d_model, max_position_embeddings=81)
+        # ── RoPE 제거: 1D 회전이 ELU 코널과 교환법칙 위배 — 절대 위치 Emb만 사용
 
         # ── K 개의 AMK_Block (거시 루프 간 가중치 공유) ───────────────
         self.blocks = nn.ModuleList([
@@ -324,10 +314,9 @@ class AMKPDModel(nn.Module):
                 d_model=d_model,
                 d_spectral=d_spectral,
                 dt=dt,
-                lam=lam,
                 expansion_ratio=expansion_ratio,
                 conv_kernel_size=conv_kernel_size,
-                use_w_v=getattr(self, 'use_w_v', False), # 옵션에 따른 W_V 사용 여부 설정
+                use_w_v=getattr(self, 'use_w_v', False),
             )
             for _ in range(num_layers)
         ])
@@ -345,6 +334,7 @@ class AMKPDModel(nn.Module):
         # ── 시각화용 텔레메트리 ───────────────────────────────────────────
         self.log_viz = False
         self.viz_Q = []
+        self.viz_H_global = []  # H_context 매크로 루프별 스냅샷 (= 실제 KDE 활동 공간)
 
         # ── 가중치 초기화 ─────────────────────────────────────────────
         self._init_weights()
@@ -359,20 +349,14 @@ class AMKPDModel(nn.Module):
 
     # ----------------------------------------------------------
     def _run_one_macro_loop(
-        self, Q: torch.Tensor, X: torch.Tensor, cos_sin: tuple = None
+        self, Q: torch.Tensor, X: torch.Tensor
     ) -> torch.Tensor:
         """
-        단일 거시적 루프: K 개의 AMK_Block 을 순차 통과.
-
-        Args:
-            Q: [B, N, d]  현재 상태
-            X: [B, N, d]  초기 상태 (탄성 복원 기준)
-            cos_sin: RoPE 적용을 위한 cos, sin 텐서 쌍
-        Returns:
-            Q: [B, N, d]  K 블록 통과 후 상태
+        단일 거시적 루프: K 개의 AMK_Block에 X 내장 후 차례로 통과.
+        Q 누적기에는 X를 직접 더하지 않음. X는 블록 내부 정보 공간에서만 작동.
         """
         for block in self.blocks:
-            Q = block(Q, X, cos_sin)   # [B, N, d] → [B, N, d]
+            Q = block(Q, X)   # [B, N, d] -> [B, N, d]
         return Q  # [B, N, d]
 
     # ----------------------------------------------------------
@@ -396,9 +380,6 @@ class AMKPDModel(nn.Module):
         X = self.embedding(input_ids) + self.pos_emb(pos)   # [B, N, d]
         X = self.input_norm(X)          # [B, N, d]
 
-        # RoPE 텐서 준비 캐싱 (N 길이에 맞게 추출)
-        cos_sin = self.rotary_emb(seq_len)
-
         # Q^(0) = X 로 초기화
         Q = X                           # [B, N, d]
 
@@ -407,22 +388,20 @@ class AMKPDModel(nn.Module):
 
         if self.log_viz:
             self.viz_Q.append(Q)
+            self.viz_H_global = []  # 매 forward 시 리셋
+            for b in self.blocks:
+                b.viz_H = []
 
         # ── 거시적 루프 (l = 1 … M) ────────────────────────────────
         for l in range(1, self.max_loops + 1):
 
             if l <= self.trunc_loops:
-                # ── Forward-only 구간 (그래디언트 누적 방지) ──────────
                 with torch.no_grad():
-                    Q = self._run_one_macro_loop(Q, X, cos_sin)  # [B, N, d]
-
-                # 다음 gradient-tracking 구간으로 그래디언트가 역류하지
-                # 않도록 계산 그래프에서 분리
-                Q = Q.detach()  # [B, N, d]
+                    Q = self._run_one_macro_loop(Q, X)  # [B, N, d]
+                Q = Q.detach()
 
             else:
-                # ── Gradient-tracking 구간 ────────────────────────────
-                Q = self._run_one_macro_loop(Q, X, cos_sin)      # [B, N, d]
+                Q = self._run_one_macro_loop(Q, X)      # [B, N, d]
 
                 # 출력 전 최종 정규화 (모델의 메인 State Q는 건드리지 않고, 출력용으로만 사용)
                 Q_out_norm = self.final_norm(Q)         # [B, N, d]
@@ -441,6 +420,9 @@ class AMKPDModel(nn.Module):
 
             if self.log_viz:
                 self.viz_Q.append(Q)
+                # 마지막 블록의 H_context를 매크로 루프 단위로 쓰기
+                if self.blocks[-1].viz_H:
+                    self.viz_H_global.append(self.blocks[-1].viz_H[-1])
 
         return logits_list, halt_probs_list
 

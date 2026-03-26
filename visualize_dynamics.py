@@ -11,6 +11,8 @@ import seaborn as sns
 from tqdm import tqdm
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
+import torch.nn.functional as F
+
 try:
     import umap
     HAS_UMAP = True
@@ -117,31 +119,37 @@ def main():
     # 텔레메트리 켜기 (몽키 패치 없이 순수 객체 변수로 추출)
     model.log_viz = True
     model.viz_Q = []
+    model.viz_H_global = []
     for b in model.blocks:
         b.log_viz = True
         b.viz_W = []
         b.viz_m = []
+        b.viz_H = []
 
     with torch.no_grad():
         model(inputs)
 
-    # 순차적 추출 (M 루프 * K 블록)
-    global_Q = [q.detach().cpu() for q in model.viz_Q] # 첫 번째 항목은 초기 상태, 이후 M개의 루프 종료 상태
+   # 순차적 추출 (M 루프 * K 블록)
+    global_Q = [q.detach().cpu() for q in model.viz_Q] 
+    global_H = [h.detach().cpu() for h in model.viz_H_global]
     global_W = []
+    global_m = [] # 추가: 안전한 참조를 위한 m 벡터 전역 리스트
+    
     M_loops = len(model.blocks[0].viz_W)
     K_blocks = len(model.blocks)
     for m_idx in range(M_loops):
+        loop_m_tensors = []
         for k_idx in range(K_blocks):
             global_W.append(model.blocks[k_idx].viz_W[m_idx].detach().cpu())
+            loop_m_tensors.append(model.blocks[k_idx].viz_m[m_idx].detach().cpu())
+        global_m.append(loop_m_tensors)
             
     # 동역학적인 Jacobian Norm (Hutchinson Estimator 활용 - 원본 코드 복제 없이 독립 수행)
     print("Calculating Dynamical Jacobian Norms via Hutchinson Estimator...")
     global_J_norm = []
     seq_len = inputs.shape[1]
-    pos = torch.arange(seq_len, device=inputs.device).unsqueeze(0)
-    cos_sin = model.rotary_emb(seq_len)
     
-    X_input = model.embedding(inputs[0:1]) + model.pos_emb(pos[:, :seq_len])
+    X_input = model.embedding(inputs[0:1]) + model.pos_emb(torch.arange(seq_len, device=inputs.device).unsqueeze(0))
     X_input = model.input_norm(X_input)
     
     # 루프마다의 입력 상태에 대해 첫 번째 블록 기준 야코비안 계산
@@ -149,7 +157,7 @@ def main():
         Q_l = global_Q[l][0:1].to(device).detach().clone().requires_grad_(True)
         model.blocks[0].viz_m = [] # Reset
         with torch.enable_grad():
-            _ = model.blocks[0](Q_l, X_input, cos_sin)
+            _ = model.blocks[0](Q_l, X_input)   # X 필수 인자: Information-Level Injection
             m_vec = model.blocks[0].viz_m[-1]
             
             norm_sq_sum = 0
@@ -300,7 +308,41 @@ def main():
     plt.close()
 
     metrics_log["effective_ranks"] = [float(er) for er in eff_ranks]
+    # ── 3.5. Step-by-Step Dynamics & Internal Parameters (추가된 코드) ──
+    print("Calculating Step-by-Step Dynamics & Internal Parameters ...")
     
+    # 1) 각 거시적 루프(Macro-Loop) 간의 이동 거리 (Delta Q)
+    step_moved_given = []
+    step_moved_blank = []
+    for l in range(1, loops):
+        # Q_cat shape: [Loops, B, N, d]
+        delta_Q = np.linalg.norm(Q_cat[l, 0].numpy() - Q_cat[l-1, 0].numpy(), axis=-1) # [81]
+        step_moved_given.append(float(delta_Q[given_mask].mean()))
+        step_moved_blank.append(float(delta_Q[~given_mask].mean()))
+        
+    metrics_log["dynamics_step_movement_given"] = step_moved_given
+    metrics_log["dynamics_step_movement_blank"] = step_moved_blank
+
+    # 2) 모델이 스스로 학습한 블록별 스텝 사이즈 (dt_safe)
+    learned_dts = []
+    for k_idx, block in enumerate(model.blocks):
+        dt_val = F.softplus(block.dt).item()
+        learned_dts.append(float(dt_val))
+    metrics_log["dynamics_learned_dt_per_block"] = learned_dts
+
+    # 3) 각 루프/블록별 중력 벡터(m)의 실제 크기 (Net Force Magnitude)
+    # m 벡터가 정말로 0에 수렴해서 입자가 멈춘 것인지 확인
+    m_vector_norms = []
+    for m_idx in range(M_loops):
+        loop_m_norms = []
+        for k_idx in range(K_blocks):
+            # 오염되지 않은 global_m 리스트에서 직접 조회
+            m_tensor = global_m[m_idx][k_idx] # [B, N, d]
+            m_norm = torch.norm(m_tensor[0], dim=-1).mean().item()
+            loop_m_norms.append(float(m_norm))
+        m_vector_norms.append(loop_m_norms) # [M_loops, K_blocks]
+        
+    metrics_log["dynamics_mean_shift_net_force"] = m_vector_norms
     # ── 4. Advanced Manifold Evaluation Metrics ───────────────────────────────
     print("Calculating 4. Advanced Manifold Metrics ...")
     
@@ -313,14 +355,18 @@ def main():
     explained_vars_top9 = []
     explained_vars_top27 = []
     
-    for l in range(loops):
-        Q_l = global_Q[l][0].numpy() # [81, d]
+    # global_H가 있으면 H_context 공간 사용 (= 실제 KDE 작용 공간), 없으면 Q로 폴백
+    use_H = len(global_H) > 0
+    n_manifold_loops = len(global_H) if use_H else loops
+
+    for l in range(n_manifold_loops):
+        feat_l = global_H[l][0].numpy() if use_H else global_Q[l][0].numpy()  # [81, d]
         
         # A) Target-Conditioned Silhouette Score
         mask = lbl != 0
         if len(np.unique(lbl[mask])) > 1:
             try:
-                sil = silhouette_score(Q_l[mask], lbl[mask])
+                sil = silhouette_score(feat_l[mask], lbl[mask])
             except Exception:
                 sil = 0.0
         else:
@@ -328,7 +374,7 @@ def main():
         target_silhouettes.append(float(sil))
         
         # B) Class-Conditioned MAD & MAD-Gap
-        Q_v = Q_l[mask]
+        Q_v = feat_l[mask]
         l_v = lbl[mask]
         if len(Q_v) > 1:
             Q_norm_v = Q_v / (np.linalg.norm(Q_v, axis=1, keepdims=True) + 1e-9)
@@ -347,7 +393,7 @@ def main():
         mad_gaps.append(float(mad_gap))
         
         # C) Singular Spectrum Explained Variance
-        U, S, V = np.linalg.svd(Q_l, full_matrices=False)
+        U, S, V = np.linalg.svd(feat_l, full_matrices=False)
         S_sq = S**2
         tot_var = S_sq.sum() + 1e-9
         explained_vars_top1.append(float(S_sq[:1].sum() / tot_var))
@@ -367,34 +413,42 @@ def main():
     ATR_history = []
     cohered_blanks_history = []
     
-    # 궤적 시각화를 위한 Q 투영 (전체 루프 데이터를 UMAP/PCA로 투영)
+    # ATR/응집 계산 대상: H_context 공간 (= 실제 중력 작용 공간)
+    # 이분 구조 투영(2D):은 Q 공간 (= 눈에 보이는 입자 움직임) 사용
+    H_arr = global_H if use_H else global_Q
+    h_loops = len(H_arr)
+    H_flat = np.stack([H_arr[l][0].numpy() for l in range(h_loops)], axis=0).reshape(h_loops * N_seq, -1)
     if HAS_UMAP:
         reducer_bipartite = umap.UMAP(n_components=2, random_state=42)
     else:
         reducer_bipartite = PCA(n_components=2)
         
-    Q_proj_flat_bip = reducer_bipartite.fit_transform(Q_flat)
+    H_proj_flat_bip = reducer_bipartite.fit_transform(H_flat)
+    H_proj_bip = H_proj_flat_bip.reshape((h_loops, N_seq, 2))
+    
+    # Q는 이분구조 시각화(Bipartite plot)에서만 사용
+    Q_proj_flat_bip = reducer_bipartite.fit_transform(Q_flat) if loops > 0 else H_proj_flat_bip
     Q_proj_bip = Q_proj_flat_bip.reshape((loops, N_seq, 2))
     
     # 클래스 1~9를 위한 색상 팔레트 (tab10의 1~9 인덱스 사용)
     palette = plt.get_cmap('tab10')
     
-    for l in range(loops):
-        Q_l = global_Q[l][0].numpy() # [81, d]
+    for l in range(h_loops):
+        H_l = H_arr[l][0].numpy() # [81, d] — 실제 중력 작용 공간
         
-        # 1. 클래스별 힌트 셀(Given Cells)의 질량 중심(Centroid) 계산
+        # 1. 클래스별 힌트 셀(Given Cells)의 질량 중심(Centroid) 계산 (H_context 기준)
         centroids = {}
         for c in range(1, 10):
             c_given_mask = given_mask & (lbl == c)
             if c_given_mask.any():
-                centroids[c] = Q_l[c_given_mask].mean(axis=0)
+                centroids[c] = H_l[c_given_mask].mean(axis=0)
                 
-        # 유저가 육안으로 확인한 "2D 시각화 공간"에서의 질량 중심 재계산
+        # 2D 시각화 공간(H_proj 기준)의 질량 중심
         centroids_2d = {}
         for c in range(1, 10):
             c_given_mask = given_mask & (lbl == c)
             if c_given_mask.any():
-                centroids_2d[c] = Q_proj_bip[l][c_given_mask].mean(axis=0)
+                centroids_2d[c] = H_proj_bip[l][c_given_mask].mean(axis=0)
                 
         # 2D 시각화 공간 상에서의 앵커(힌트 셀) 군집 간 평균 거리
         if len(centroids_2d) > 1:
@@ -415,17 +469,17 @@ def main():
             if not given_mask[idx]: # 빈칸 셀인 경우
                 true_c = lbl[idx]
                 if true_c in centroids:
-                    # 1) 원본 고차원 거리 (ATR 지표 산출용)
-                    d_target = np.linalg.norm(Q_l[idx] - centroids[true_c])
+                    # 1) H_context 고차원 거리 (ATR 지표)
+                    d_target = np.linalg.norm(H_l[idx] - centroids[true_c])
                     d_targets.append(d_target)
                     
-                    # 2) 시각적 2D 화면 거리 (유저 관찰용 응집 카운팅)
-                    d_target_2d = np.linalg.norm(Q_proj_bip[l, idx] - centroids_2d[true_c])
+                    # 2) H_proj 2D 화면 거리 (응집 카운팅)
+                    d_target_2d = np.linalg.norm(H_proj_bip[l, idx] - centroids_2d[true_c])
                     if d_target_2d < cohesion_threshold_2d:
                         cohered_blanks += 1
                         
-                    # 오답 앵커들과의 평균 거리
-                    remote_dists = [np.linalg.norm(Q_l[idx] - centroids[k]) for k in centroids if k != true_c]
+                    # 오답 앵커들과의 평균 거리 (H_context 기준)
+                    remote_dists = [np.linalg.norm(H_l[idx] - centroids[k]) for k in centroids if k != true_c]
                     if remote_dists:
                         d_remotes.append(np.mean(remote_dists))
         
