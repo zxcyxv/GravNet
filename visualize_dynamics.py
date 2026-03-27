@@ -20,7 +20,7 @@ except ImportError:
     HAS_UMAP = False
 
 from dataset import create_dataloaders
-from amkpd_model import AMKPDModel, AMK_Block
+from amkpd_model import AMKPDModel, AMK_Block, AMKPDCarry
 from train import build_optimizer_and_scheduler, compute_loss
 
 def calculate_effective_rank(Q):
@@ -64,10 +64,12 @@ def main():
         vocab_size=meta["vocab_size"],
         d_model=args.d_model,
         d_spectral=args.d_spectral,
-        num_layers=ckpt_args.get("num_layers", 3), 
-        max_loops=ckpt_args.get("max_loops", 6), 
-        trunc_loops=ckpt_args.get("trunc_loops", 3),
-        use_w_v=ckpt_args.get("use_w_v", False) # 강력히 보장하는 옵션 A 설정 (수학적 통일성 유지)
+        num_layers=ckpt_args.get("num_layers", 3),
+        loops=ckpt_args.get("loops", 6),
+        H_cycles=ckpt_args.get("H_cycles", 2),
+        L_cycles=ckpt_args.get("L_cycles", 1),
+        kernel_power=ckpt_args.get("kernel_power", 2),
+        use_w_v=ckpt_args.get("use_w_v", False),
     ).to(device)
 
     # Fake train args
@@ -75,10 +77,10 @@ def main():
         weight_decay = 0.1
         lr = 3e-4
         warmup_steps = 100
-        aux_loss_coef = 0.3
-        act_loss_coef = 0.01
+        halt_loss_coef = 0.01
         grad_accum = 1
         max_grad_norm = 1.0
+        loops = ckpt_args.get("loops", 6)
 
     t_args = TrainArgs()
     optimizer, scheduler = build_optimizer_and_scheduler(model, t_args, args.train_steps)
@@ -93,15 +95,22 @@ def main():
             
         model.train()
         step = 0
+        seq_len = meta["seq_len"]
+        carry = model.initial_carry(args.batch_size, seq_len, device)
         pbar = tqdm(total=args.train_steps, desc="Pre-Training for Viz")
         while step < args.train_steps:
             for inputs, labels in train_loader:
                 if step >= args.train_steps: break
                 inputs, labels = inputs.to(device), labels.to(device)
+                if inputs.shape[0] != carry.current_hidden.shape[0]:
+                    carry = model.initial_carry(inputs.shape[0], seq_len, device)
+                batch = (inputs, labels)
                 optimizer.zero_grad()
-                logits_list, halt_probs = model(inputs)
-                loss, _ = compute_loss(logits_list, halt_probs, labels, t_args)
-                loss.backward()
+                # Deep Supervision: 매 외부 루프마다 loss + backward 누적
+                for _t in range(t_args.loops):
+                    carry, logits, halt_logits = model(carry, batch)
+                    loss, _ = compute_loss(logits, halt_logits, carry.current_labels, t_args)
+                    (loss / t_args.loops).backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
@@ -109,68 +118,127 @@ def main():
                 pbar.update(1)
         pbar.close()
 
-    # 4. Extracting Features (Native Telemetry)
+    # 4. Extracting Features (Native Telemetry via multi-forward carry loop)
     model.eval()
     print("Extracting features (1 batch, up to 64 samples) ...")
     inputs, labels = next(iter(test_loader))
     inputs = inputs[:min(64, inputs.shape[0])].to(device)
     labels = labels[:inputs.shape[0]].to(device)
-    
-    # 텔레메트리 켜기 (몽키 패치 없이 순수 객체 변수로 추출)
+    B_viz = inputs.shape[0]
+    seq_len = inputs.shape[1]
+
+    # 텔레메트리 켜기
     model.log_viz = True
-    model.viz_Q = []
-    model.viz_H_global = []
     for b in model.blocks:
         b.log_viz = True
-        b.viz_W = []
-        b.viz_m = []
-        b.viz_H = []
+
+    # carry 기반 다중 forward로 텔레메트리 수집
+    carry = model.initial_carry(B_viz, seq_len, device)
+    batch = (inputs, labels)
+
+    # 외부 루프별 텔레메트리 수집
+    global_Q = []
+    global_H = []
+    global_W = []
+    global_m = []
+    K_blocks = len(model.blocks)
+    M_loops = model.loops
 
     with torch.no_grad():
-        model(inputs)
+        # 초기 상태 수집
+        global_Q.append(carry.current_hidden.detach().cpu())
 
-   # 순차적 추출 (M 루프 * K 블록)
-    global_Q = [q.detach().cpu() for q in model.viz_Q] 
-    global_H = [h.detach().cpu() for h in model.viz_H_global]
-    global_W = []
-    global_m = [] # 추가: 안전한 참조를 위한 m 벡터 전역 리스트
-    
-    M_loops = len(model.blocks[0].viz_W)
-    K_blocks = len(model.blocks)
-    for m_idx in range(M_loops):
-        loop_m_tensors = []
-        for k_idx in range(K_blocks):
-            global_W.append(model.blocks[k_idx].viz_W[m_idx].detach().cpu())
-            loop_m_tensors.append(model.blocks[k_idx].viz_m[m_idx].detach().cpu())
-        global_m.append(loop_m_tensors)
-            
-    # 동역학적인 Jacobian Norm (Hutchinson Estimator 활용 - 원본 코드 복제 없이 독립 수행)
+        for outer in range(M_loops):
+            # 각 forward 호출 전 블록 텔레메트리 리셋
+            for b in model.blocks:
+                b.viz_W = []
+                b.viz_m = []
+                b.viz_H = []
+            model.viz_Q = []
+            model.viz_H_global = []
+
+            carry, logits, halt_logits = model(carry, batch)
+
+            # forward 내부에서 수집된 텔레메트리 추출
+            # viz_Q: L_cycles + 1개 (gradient H_cycle의 각 L_cycle 경계)
+            for q in model.viz_Q:
+                if isinstance(q, torch.Tensor):
+                    global_Q.append(q.detach().cpu())
+            for h in model.viz_H_global:
+                if isinstance(h, torch.Tensor):
+                    global_H.append(h.detach().cpu())
+
+            # 블록별 W, m 수집 (gradient H_cycle에서만)
+            n_micro = len(model.blocks[0].viz_W)
+            for mi in range(n_micro):
+                loop_m_tensors = []
+                for k_idx in range(K_blocks):
+                    global_W.append(model.blocks[k_idx].viz_W[mi].detach().cpu())
+                    loop_m_tensors.append(model.blocks[k_idx].viz_m[mi].detach().cpu())
+                global_m.append(loop_m_tensors)
+
+    # 동역학적인 Jacobian Norm (Hutchinson Estimator)
     print("Calculating Dynamical Jacobian Norms via Hutchinson Estimator...")
     global_J_norm = []
-    seq_len = inputs.shape[1]
-    
+
     X_input = model.embedding(inputs[0:1]) + model.pos_emb(torch.arange(seq_len, device=inputs.device).unsqueeze(0))
     X_input = model.input_norm(X_input)
-    
-    # 루프마다의 입력 상태에 대해 첫 번째 블록 기준 야코비안 계산
-    for l in range(M_loops):
+
+    n_jacobian_steps = len(global_Q) - 1
+    for l in range(n_jacobian_steps):
         Q_l = global_Q[l][0:1].to(device).detach().clone().requires_grad_(True)
-        model.blocks[0].viz_m = [] # Reset
+        # X 주입 후 첫 번째 블록 야코비안 계산 (URM L_cycle 패턴)
+        Q_injected = Q_l + X_input
+        model.blocks[0].viz_m = []
         with torch.enable_grad():
-            _ = model.blocks[0](Q_l, X_input)   # X 필수 인자: Information-Level Injection
+            _ = model.blocks[0](Q_injected)
             m_vec = model.blocks[0].viz_m[-1]
-            
+
             norm_sq_sum = 0
             for _ in range(5):
                 v = torch.randn_like(m_vec)
                 vjp = torch.autograd.grad(m_vec, Q_l, v, retain_graph=True)[0]
                 norm_sq_sum += (vjp ** 2).sum().item()
             global_J_norm.append(math.sqrt(norm_sq_sum / 5.0))
-            
+
+    # ── B. Maximal Lyapunov Exponent (MLE) 근사 측정 ──
+    print("Calculating Maximal Lyapunov Exponent (MLE) ...")
+
+    epsilon = 1e-5
+    perturbation = torch.randn_like(X_input)
+    perturbation = perturbation / torch.norm(perturbation, dim=-1, keepdim=True) * epsilon
+    X_perturbed = X_input + perturbation
+
+    Q_orig = X_input.clone()
+    Q_pert = X_perturbed.clone()
+
+    lyapunov_exponents = []
+    log_sum = 0.0
+
+    with torch.no_grad():
+        for l in range(n_jacobian_steps):
+            # L_cycle: X 주입 + 블록 통과
+            Q_orig = Q_orig + X_input
+            Q_pert = Q_pert + X_perturbed
+            for block in model.blocks:
+                Q_orig = block(Q_orig)
+                Q_pert = block(Q_pert)
+
+            delta_Q = torch.norm(Q_pert - Q_orig, dim=-1).mean().item()
+
+            log_sum += math.log(delta_Q / epsilon)
+            mle = log_sum / (l + 1)
+            lyapunov_exponents.append(mle)
+
+            Q_pert = Q_orig + (Q_pert - Q_orig) / (delta_Q + 1e-12) * epsilon
+
     # 텔레메트리 끄기
     model.log_viz = False
     for b in model.blocks:
         b.log_viz = False
+
+    # M_loops 재정의: 실제 수집된 외부 루프 수 (Jacobian/MLE 스텝)
+    M_loops = n_jacobian_steps
 
     os.makedirs("visualizations", exist_ok=True)
     metrics_log = {}
@@ -391,7 +459,40 @@ def main():
             mad_gap = 0.0
             
         mad_gaps.append(float(mad_gap))
-        
+
+        # ── A. Neural Collapse Indices (NC1, NC2) ──
+        if len(np.unique(l_v)) > 1:
+            classes = np.unique(l_v)
+            num_classes = len(classes)
+            global_mean = np.mean(Q_v, axis=0)
+
+            class_means = []
+            within_class_scatter = 0.0
+            for c in classes:
+                Q_c = Q_v[l_v == c]
+                mu_c = np.mean(Q_c, axis=0)
+                class_means.append(mu_c)
+                within_class_scatter += np.sum(np.linalg.norm(Q_c - mu_c, axis=1)**2)
+
+            within_class_scatter /= len(Q_v)
+
+            class_means = np.array(class_means)
+            between_class_scatter = np.sum(np.linalg.norm(class_means - global_mean, axis=1)**2) / num_classes
+
+            nc1 = within_class_scatter / (between_class_scatter + 1e-9)
+
+            M_mat = (class_means - global_mean).T  # [d, num_classes]
+            M_norm_sq = np.linalg.norm(M_mat, 'fro')**2 + 1e-9
+            cos_mat = (M_mat.T @ M_mat) / M_norm_sq
+
+            ideal_etf = (num_classes / (num_classes - 1)) * np.eye(num_classes) - (1 / (num_classes - 1)) * np.ones((num_classes, num_classes))
+            nc2 = np.linalg.norm(cos_mat - ideal_etf, 'fro')
+        else:
+            nc1, nc2 = 0.0, 0.0
+
+        metrics_log.setdefault("manifold_nc1_collapse", []).append(float(nc1))
+        metrics_log.setdefault("manifold_nc2_etf", []).append(float(nc2))
+
         # C) Singular Spectrum Explained Variance
         U, S, V = np.linalg.svd(feat_l, full_matrices=False)
         S_sq = S**2
@@ -406,6 +507,7 @@ def main():
     metrics_log["manifold_explained_variance_top9"] = explained_vars_top9
     metrics_log["manifold_explained_variance_top27"] = explained_vars_top27
     metrics_log["dynamics_jacobian_norms"] = global_J_norm
+    metrics_log["dynamics_maximal_lyapunov_exponent"] = lyapunov_exponents
     
     # ── 5. Anchor-Target Ratio (ATR) & Bipartite Trajectory ─────────────────
     print("Calculating and Plotting 5. Target-Conditioned Bipartite Trajectory & ATR ...")

@@ -2,10 +2,11 @@
 AMK-PD: Asymmetric Mapped Kernel Particle Dynamics
 PyTorch 구현
 
-아키텍처 개요:
-- 입력 시퀀스 X ∈ R^(B×N×d)를 초기 상태로 하여 거시적 루프(Macro-Loop)를 M번 반복
-- 단일 거시적 루프 내부에 K개의 AMK_Block이 직렬 배치 (Micro-Depth)
-- TBPTL (Truncated Backpropagation Through Loops) 최적화 적용
+아키텍처 개요 (URM 3중 루프 + Carry 구조):
+- 외부 루프(loops): carry를 유지하며 반복 호출. 샘플별 adaptive halting.
+- 중간 루프(H_cycles): H-1회 no_grad burn-in + 마지막 1회 gradient 추적.
+- 내부 루프(L_cycles): Q = Q + X 주입 후 K개 블록 순차 통과.
+- Markovian gradient isolation: forward 1회의 gradient depth = L_cycles × K.
 """
 
 import math
@@ -13,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm
+from dataclasses import dataclass, replace
 
 
 # ============================================================
@@ -36,6 +38,16 @@ class RotaryEmbedding(nn.Module):
             self.cos_cached[:, :seq_len, ...],
             self.sin_cached[:, :seq_len, ...]
         )
+
+@dataclass
+class AMKPDCarry:
+    """URM의 URMCarry에 대응하는 carry 구조체 (ref/urm.py:14-18)"""
+    current_hidden: torch.Tensor   # [B, N, d] — detached 은닉 상태
+    steps: torch.Tensor            # [B] int32 — 외부 루프 카운터
+    halted: torch.Tensor           # [B] bool — 샘플별 정지 플래그
+    current_inputs: torch.Tensor   # [B, N] long — 저장된 입력 토큰
+    current_labels: torch.Tensor   # [B, N] long — 저장된 정답 라벨
+
 
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
@@ -63,6 +75,7 @@ class AMK_Block(nn.Module):
         dt             (float): Explicit Euler 스텝 사이즈 초기값 (학습 가능)
         expansion_ratio(int)  : ConvSwiGLU 내부 팽창 비율 m
         conv_kernel_size(int) : Depthwise Conv1D 커널 크기
+        kernel_power   (int)  : 인력 행렬 다항식 거듭제곱 차수 (1=선형, 2=이차, 3=삼차)
     """
 
     def __init__(
@@ -73,11 +86,13 @@ class AMK_Block(nn.Module):
         expansion_ratio: int = 4,
         conv_kernel_size: int = 3,
         use_w_v: bool = False,
+        kernel_power: int = 2,
     ):
         super().__init__()
         self.d_model = d_model          # d
         self.d_spectral = d_spectral    # D
         self.use_w_v = use_w_v
+        self.kernel_power = kernel_power
         inner_dim = expansion_ratio * d_model  # m * d
 
         # ── 학습 가능한 스텝 파라미터 ──────────────────────────────────
@@ -139,11 +154,10 @@ class AMK_Block(nn.Module):
         self.viz_H = []  # H_context = LayerNorm(Q) + X — 실제 중력 작용 공간
 
     # ----------------------------------------------------------
-    def forward(self, Q_in: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    def forward(self, Q_in: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Q_in : [B, N, d]  현재 은닉 상태 (순수 잔차 누적기)
-            X    : [B, N, d]  입력 정보 안커 (input_norm 통과 후 값)
+            Q_in : [B, N, d]  현재 은닉 상태 (X가 이미 L_cycle 시작 시 주입된 상태)
         Returns:
             Q_out: [B, N, d]  업데이트된 은닉 상태
         """
@@ -157,48 +171,42 @@ class AMK_Block(nn.Module):
         # Pre-Norm 적용
         Q_norm1 = self.norm1(Q_in)                  # [B, N, d]
 
-        # 핵심: 정보 공간(Information Space)에서만 X 주입
-        # 누적기 Q에는 직접 더하지 않음 — 노름 폭발 원천 차단
-        H_context = Q_norm1 + X                     # [B, N, d]
+        # URM 패턴: X 주입은 L_cycle 시작 시 한 번만 (블록 내부에서는 미사용)
+        # Q_norm1을 직접 사용 (기존 H_context 역할)
 
-        # 시퀀스 축(N)에 대해 Mean Pooling → 거시 상태 벡터 (H_context 기준)
-        q_pool = H_context.mean(dim=1)              # [B, d]
+        # 시퀀스 축(N)에 대해 Mean Pooling → 거시 상태 벡터
+        q_pool = Q_norm1.mean(dim=1)                # [B, d]
 
         # 하이퍼네트워크 통과 → d×D 행렬로 복원
         Omega_Q = self.hyper_q(q_pool).view(B, d, D)  # [B, d, D]
         Omega_K = self.hyper_k(q_pool).view(B, d, D)  # [B, d, D]
 
         # ══════════════════════════════════════════════════════
-        # Step 2: Neural Bochner Spectral Mapping (H_context 기준)
+        # Step 2: Neural Bochner Spectral Mapping
         # ══════════════════════════════════════════════════════
 
-        # X의 앵커 정보를 포함한 커널 사영 (RoPE 제거)
-        Phi_Q = F.elu(torch.bmm(H_context, Omega_Q) + self.B_Q) + 1.0  # [B, N, D]
-        Phi_K = F.elu(torch.bmm(H_context, Omega_K) + self.B_K) + 1.0  # [B, N, D]
+        Phi_Q = F.elu(torch.bmm(Q_norm1, Omega_Q) + self.B_Q) + 1.0  # [B, N, D]
+        Phi_K = F.elu(torch.bmm(Q_norm1, Omega_K) + self.B_K) + 1.0  # [B, N, D]
 
         # ══════════════════════════════════════════════════════
-        # Step 3: Gravitational Mean Shift (H_context 안커 기준)
+        # Step 3: Gravitational Mean Shift
         # ══════════════════════════════════════════════════════
 
-        # V 및 anchor: H_context 공간에서 정의 (X의 안커 역할 내재화)
         if getattr(self, 'use_w_v', False):
-            V      = self.W_V(H_context)            # [B, N, d]
+            V      = self.W_V(Q_norm1)              # [B, N, d]
             anchor = V
         else:
-            V      = H_context                      # [B, N, d]
-            anchor = H_context
+            V      = Q_norm1                        # [B, N, d]
+            anchor = Q_norm1
 
-        # 전역 컨텍스트: C = Phi_K^T @ V
-        C = torch.bmm(Phi_K.transpose(1, 2), V)     # [B, D, d]
+        # 명시적 인력 행렬 (N=81이므로 O(N²) 비용 ≈ O(1) 수준)
+        W = torch.bmm(Phi_Q, Phi_K.transpose(1, 2))   # [B, N, N]
+        # 다항식 커널 샤프닝: ReLU 후 거듭제곱으로 Winner-takes-all 희소성 증폭
+        W = F.relu(W) ** self.kernel_power             # [B, N, N]
 
-        # 인력: Attraction = Phi_Q @ C
-        Attraction = torch.bmm(Phi_Q, C)             # [B, N, d]
-
-        # 정규화 항
-        ones_N = torch.ones(B, N, 1, device=Q_in.device, dtype=Q_in.dtype)
-        phi_k_sum = torch.bmm(Phi_K.transpose(1, 2), ones_N).squeeze(-1)  # [B, D]
-        denom = torch.bmm(Phi_Q, phi_k_sum.unsqueeze(-1)).squeeze(-1)
-        Norm = denom.abs() + 1.0
+        # Attraction 및 행 방향 정규화
+        Attraction = torch.bmm(W, V)                   # [B, N, d]
+        Norm = W.sum(dim=-1).abs() + 1.0               # [B, N]
 
         # Mean Shift 벡터 (H_context 안커 기준)
         m = Attraction / Norm.unsqueeze(-1) - anchor   # [B, N, d]
@@ -215,11 +223,10 @@ class AMK_Block(nn.Module):
 
         # ── 시각화 캐싱 ──────────────────────────────────────────────────
         if self.log_viz:
-            W_raw = torch.bmm(Phi_Q, Phi_K.transpose(1, 2))
-            W_norm = W_raw / Norm.unsqueeze(-1)
+            W_norm = W / Norm.unsqueeze(-1)   # 이미 다항식 커널 적용된 W 재사용
             self.viz_W.append(W_norm)
             self.viz_m.append(m)
-            self.viz_H.append(H_context)  # 실제 동역학 개입 공간 캐싱
+            self.viz_H.append(Q_norm1)  # 블록 입력 공간 캐싱 (기존 H_context 역할)
             
         # ══════════════════════════════════════════════════════
         # Step 4: ConvSwiGLU with Micro-Residual
@@ -254,23 +261,23 @@ class AMK_Block(nn.Module):
 
 class AMKPDModel(nn.Module):
     """
-    AMK-PD Model
+    AMK-PD Model (URM 3중 루프 + Carry 구조)
 
-    거시적 루프(Macro-Loop)를 M회 반복하며,
-    각 루프 안에서 K개의 AMK_Block 을 직렬 통과시킵니다.
-    TBPTL 로 초기 N_trunc 루프는 no_grad 로 실행하고,
-    이후 루프에서만 그래디언트를 추적합니다.
+    외부 루프(loops): carry 유지, 샘플별 adaptive halting.
+    중간 루프(H_cycles): H-1회 no_grad burn-in + 마지막 1회 gradient.
+    내부 루프(L_cycles): Q = Q + X 주입 후 K개 블록 통과.
 
     Args:
         vocab_size     (int)  : 어휘 크기
         d_model        (int)  : 은닉 차원 d
         d_spectral     (int)  : 스펙트럼 차원 D
-        num_layers     (int)  : 거시 루프 내 AMK_Block 수 K (Micro-Depth)
-        max_loops      (int)  : 최대 거시 루프 횟수 M
-        trunc_loops    (int)  : TBPTL forward-only 구간 N_trunc
+        num_layers     (int)  : L_cycle당 AMK_Block 수 K
+        loops          (int)  : 외부 루프 최대 횟수 (carry 재호출 횟수)
+        H_cycles       (int)  : 중간 루프 횟수 (H-1회 no_grad + 1회 grad)
+        L_cycles       (int)  : 내부 루프 횟수 (X 주입 + 블록 통과)
         dt             (float): Euler 스텝 초기값 (각 블록이 독립적으로 학습)
-        lam            (float): 탄성 주입 강도 초기값 (모델 수준 단일 파라미터)
-        expansion_ratio(int)  : ConvSwiGLU 팽창 비율 m
+        kernel_power   (int)  : 인력 행렬 다항식 거듭제곱 차수
+        expansion_ratio(int)  : ConvSwiGLU 팽창 비율
         conv_kernel_size(int) : Depthwise Conv 커널 크기
     """
 
@@ -280,35 +287,34 @@ class AMKPDModel(nn.Module):
         d_model: int = 256,
         d_spectral: int = 128,
         num_layers: int = 4,
-        max_loops: int = 8,
-        trunc_loops: int = 4,
+        loops: int = 6,
+        H_cycles: int = 2,
+        L_cycles: int = 1,
         dt: float = 0.1,
-        lam: float = 0.1,
+        kernel_power: int = 2,
         expansion_ratio: int = 4,
         conv_kernel_size: int = 3,
         use_w_v: bool = False,
     ):
         super().__init__()
-        assert trunc_loops < max_loops, (
-            "trunc_loops 는 max_loops 보다 작아야 합니다. "
-            f"(trunc_loops={trunc_loops}, max_loops={max_loops})"
-        )
-
-        self.d_model     = d_model
-        self.num_layers  = num_layers   # K
-        self.max_loops   = max_loops    # M
-        self.trunc_loops = trunc_loops  # N_trunc
-
-        # lam 파라미터 제거: X는 이제 블록 내부 정보 공간에서만 작동
+        self.d_model    = d_model
+        self.num_layers = num_layers   # K
+        self.loops      = loops        # 외부 루프 최대 횟수
+        self.H_cycles   = H_cycles     # 중간 루프 (H-1 no_grad + 1 grad)
+        self.L_cycles   = L_cycles     # 내부 루프
 
         # ── 토큰 임베딩 ───────────────────────────────────────────────
         self.embedding   = nn.Embedding(vocab_size, d_model)
-        self.pos_emb     = nn.Embedding(8192, d_model)  # 1D Absolute Positional Embedding
+        self.pos_emb     = nn.Embedding(8192, d_model)
         self.input_norm  = nn.LayerNorm(d_model)
 
-        # ── RoPE 제거: 1D 회전이 ELU 코널과 교환법칙 위배 — 절대 위치 Emb만 사용
+        # ── Carry 리셋용 초기 벡터 (URM urm.py:101-104) ──────────────
+        self.register_buffer(
+            'init_hidden',
+            torch.randn(d_model) * 0.02,
+        )
 
-        # ── K 개의 AMK_Block (거시 루프 간 가중치 공유) ───────────────
+        # ── K 개의 AMK_Block (루프 간 가중치 공유) ────────────────────
         self.blocks = nn.ModuleList([
             AMK_Block(
                 d_model=d_model,
@@ -316,7 +322,8 @@ class AMKPDModel(nn.Module):
                 dt=dt,
                 expansion_ratio=expansion_ratio,
                 conv_kernel_size=conv_kernel_size,
-                use_w_v=getattr(self, 'use_w_v', False),
+                use_w_v=use_w_v,
+                kernel_power=kernel_power,
             )
             for _ in range(num_layers)
         ])
@@ -324,8 +331,7 @@ class AMKPDModel(nn.Module):
         # ── 최종 출력 정규화 ──────────────────────────────────────────
         self.final_norm = nn.LayerNorm(d_model)
 
-        # ── ACT Halting Head ──────────────────────────────────────────
-        # q_pool(d) → 정지 확률 스칼라
+        # ── Halting Head (URM urm.py:81,107-108 패턴) ─────────────────
         self.halt_head = nn.Linear(d_model, 1)
 
         # ── Language Modeling Head ────────────────────────────────────
@@ -334,7 +340,7 @@ class AMKPDModel(nn.Module):
         # ── 시각화용 텔레메트리 ───────────────────────────────────────────
         self.log_viz = False
         self.viz_Q = []
-        self.viz_H_global = []  # H_context 매크로 루프별 스냅샷 (= 실제 KDE 활동 공간)
+        self.viz_H_global = []
 
         # ── 가중치 초기화 ─────────────────────────────────────────────
         self._init_weights()
@@ -343,88 +349,140 @@ class AMKPDModel(nn.Module):
     def _init_weights(self):
         nn.init.normal_(self.embedding.weight, std=0.02)
         nn.init.normal_(self.pos_emb.weight, std=0.02)
-        nn.init.xavier_uniform_(self.halt_head.weight)
-        nn.init.zeros_(self.halt_head.bias)
         nn.init.normal_(self.lm_head.weight, std=0.02)
+        # halt_head: 바이어스를 -5로 초기화 → 조기 정지 억제 (URM urm.py:108)
+        nn.init.zeros_(self.halt_head.weight)
+        nn.init.constant_(self.halt_head.bias, -5.0)
 
     # ----------------------------------------------------------
-    def _run_one_macro_loop(
-        self, Q: torch.Tensor, X: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        단일 거시적 루프: K 개의 AMK_Block에 X 내장 후 차례로 통과.
-        Q 누적기에는 X를 직접 더하지 않음. X는 블록 내부 정보 공간에서만 작동.
-        """
+    def initial_carry(
+        self, batch_size: int, seq_len: int, device: torch.device
+    ) -> AMKPDCarry:
+        """에폭 시작 시 carry 초기화 (URM urm.py:180-188)"""
+        return AMKPDCarry(
+            current_hidden=torch.empty(
+                batch_size, seq_len, self.d_model,
+                dtype=self.init_hidden.dtype, device=device,
+            ),
+            steps=torch.zeros(batch_size, dtype=torch.int32, device=device),
+            halted=torch.ones(batch_size, dtype=torch.bool, device=device),
+            current_inputs=torch.empty(batch_size, seq_len, dtype=torch.long, device=device),
+            current_labels=torch.empty(batch_size, seq_len, dtype=torch.long, device=device),
+        )
+
+    # ----------------------------------------------------------
+    def reset_carry(
+        self, reset_flag: torch.Tensor, carry: AMKPDCarry
+    ) -> AMKPDCarry:
+        """halted 샘플만 init_hidden으로 리셋 (URM urm.py:134-140)"""
+        new_hidden = torch.where(
+            reset_flag.view(-1, 1, 1),
+            self.init_hidden,
+            carry.current_hidden,
+        )
+        return replace(carry, current_hidden=new_hidden)
+
+    # ----------------------------------------------------------
+    def _run_blocks(self, Q: torch.Tensor) -> torch.Tensor:
+        """K개 블록 순차 통과 = 1 L_cycle의 블록 체인 (X 주입은 외부에서)"""
         for block in self.blocks:
-            Q = block(Q, X)   # [B, N, d] -> [B, N, d]
-        return Q  # [B, N, d]
+            Q = block(Q)
+        return Q
 
     # ----------------------------------------------------------
-    def forward(self, input_ids: torch.Tensor):
+    def forward(
+        self,
+        carry: AMKPDCarry,
+        batch: tuple,  # (inputs: [B, N], labels: [B, N])
+    ):
         """
-        TBPTL 을 적용한 전방 패스.
+        URM 3중 루프 구조의 단일 외부 루프 호출.
 
         Args:
-            input_ids: [B, N]  토큰 인덱스
+            carry: 이전 상태 (initial_carry 또는 이전 forward의 반환값)
+            batch: (inputs, labels) 텐서 튜플
 
         Returns:
-            (logits_list, halt_probs_list)
-                logits_list     : gradient-tracking 구간 각 루프의
-                                  [B, N, vocab_size] 로짓 텐서 리스트
-                halt_probs_list : gradient-tracking 구간 각 루프의
-                                  [B, 1] 정지 확률 스칼라 리스트
+            (new_carry, logits, halt_logits)
+                new_carry   : 갱신된 AMKPDCarry (current_hidden detached)
+                logits      : [B, N, vocab_size]
+                halt_logits : [B, 1] (raw logits, sigmoid 미적용)
         """
-        # 임베딩 및 정규화
-        seq_len = input_ids.shape[1]
-        pos = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
-        X = self.embedding(input_ids) + self.pos_emb(pos)   # [B, N, d]
-        X = self.input_norm(X)          # [B, N, d]
+        inputs, labels = batch
 
-        # Q^(0) = X 로 초기화
-        Q = X                           # [B, N, d]
+        # ── Step A: 데이터 수락 (halted 샘플만 새 데이터 수락) ─────────
+        new_carry = self.reset_carry(carry.halted, carry)
+        new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
 
-        logits_list:     list[torch.Tensor] = []
-        halt_probs_list: list[torch.Tensor] = []
+        # halted 샘플: 새 입력/라벨 수락, non-halted: 기존 유지
+        halted_mask_inp = carry.halted.view(-1, 1).expand_as(inputs)
+        new_inputs = torch.where(halted_mask_inp, inputs, carry.current_inputs)
+        new_labels = torch.where(halted_mask_inp, labels, carry.current_labels)
 
+        # ── Step B: 입력 임베딩 (current_inputs 기준) ─────────────────
+        seq_len = new_inputs.shape[1]
+        pos = torch.arange(seq_len, device=new_inputs.device).unsqueeze(0)
+        X = self.embedding(new_inputs) + self.pos_emb(pos)
+        X = self.input_norm(X)  # [B, N, d]
+
+        Q = new_carry.current_hidden  # [B, N, d]
+
+        # ── Step C: 3중 루프 본체 ─────────────────────────────────────
+        # H_cycles-1회: no_grad burn-in (URM urm.py:151-157)
+        if self.H_cycles > 1:
+            with torch.no_grad():
+                for _h in range(self.H_cycles - 1):
+                    for _l in range(self.L_cycles):
+                        Q = Q + X                     # X 주입 (L_cycle 시작)
+                        Q = self._run_blocks(Q)       # K 블록 통과
+
+        # 마지막 1 H_cycle: gradient 추적 (URM urm.py:159-162)
         if self.log_viz:
-            self.viz_Q.append(Q)
-            self.viz_H_global = []  # 매 forward 시 리셋
+            self.viz_Q = []
+            self.viz_H_global = []
             for b in self.blocks:
                 b.viz_H = []
+            self.viz_Q.append(Q.detach())
 
-        # ── 거시적 루프 (l = 1 … M) ────────────────────────────────
-        for l in range(1, self.max_loops + 1):
-
-            if l <= self.trunc_loops:
-                with torch.no_grad():
-                    Q = self._run_one_macro_loop(Q, X)  # [B, N, d]
-                Q = Q.detach()
-
-            else:
-                Q = self._run_one_macro_loop(Q, X)      # [B, N, d]
-
-                # 출력 전 최종 정규화 (모델의 메인 State Q는 건드리지 않고, 출력용으로만 사용)
-                Q_out_norm = self.final_norm(Q)         # [B, N, d]
-
-                # ACT Halting Head: 정지 확률 계산
-                q_pool_l = Q_out_norm.mean(dim=1)       # [B, d]
-                p_halt   = torch.sigmoid(
-                    self.halt_head(q_pool_l)            # [B, 1]
-                )                                       # [B, 1]  ∈ (0, 1)
-
-                # Language Modeling Head
-                logits = self.lm_head(Q_out_norm)       # [B, N, vocab_size]
-
-                logits_list.append(logits)
-                halt_probs_list.append(p_halt)
+        for _l in range(self.L_cycles):
+            Q = Q + X                             # X 주입
+            Q = self._run_blocks(Q)               # K 블록 통과
 
             if self.log_viz:
-                self.viz_Q.append(Q)
-                # 마지막 블록의 H_context를 매크로 루프 단위로 쓰기
+                self.viz_Q.append(Q.detach())
                 if self.blocks[-1].viz_H:
                     self.viz_H_global.append(self.blocks[-1].viz_H[-1])
 
-        return logits_list, halt_probs_list
+        # ── Step D: 출력 헤드 ─────────────────────────────────────────
+        Q_norm = self.final_norm(Q)                   # [B, N, d]
+        logits = self.lm_head(Q_norm)                 # [B, N, vocab_size]
+        halt_logits = self.halt_head(Q_norm.mean(dim=1))  # [B, 1]
+
+        # ── Step E: carry 갱신 + halting 판정 ─────────────────────────
+        with torch.no_grad():
+            new_steps = new_steps + 1
+            halted = (new_steps >= self.loops)
+
+            if self.training and self.loops > 1:
+                halted = halted | (halt_logits.squeeze(-1) > 0)
+
+                # Halt exploration (URM urm.py:224-226)
+                halt_exploration_prob = 0.1
+                explore_mask = torch.rand_like(halt_logits.squeeze(-1)) < halt_exploration_prob
+                min_halt_steps = explore_mask * torch.randint_like(
+                    new_steps, low=2, high=self.loops + 1
+                )
+                halted = halted & (new_steps >= min_halt_steps)
+
+        new_carry = AMKPDCarry(
+            current_hidden=Q.detach(),   # Markovian isolation (URM urm.py:164)
+            steps=new_steps,
+            halted=halted,
+            current_inputs=new_inputs,
+            current_labels=new_labels,
+        )
+
+        return new_carry, logits, halt_logits
 
 
 # ============================================================
@@ -437,10 +495,11 @@ if __name__ == "__main__":
     D_MODEL         = 128
     D_SPECTRAL      = 64
     NUM_LAYERS      = 3      # K
-    MAX_LOOPS       = 6      # M
-    TRUNC_LOOPS     = 3      # N_trunc
+    LOOPS           = 6      # 외부 루프
+    H_CYCLES        = 2      # 중간 루프 (1회 no_grad + 1회 grad)
+    L_CYCLES        = 1      # 내부 루프
     DT              = 0.1
-    LAM             = 0.1
+    KERNEL_POWER    = 2
     EXPANSION_RATIO = 4
     CONV_KERNEL     = 3
 
@@ -452,16 +511,17 @@ if __name__ == "__main__":
 
     # ── 모델 초기화 ───────────────────────────────────────────────────
     model = AMKPDModel(
-        vocab_size      = VOCAB_SIZE,
-        d_model         = D_MODEL,
-        d_spectral      = D_SPECTRAL,
-        num_layers      = NUM_LAYERS,
-        max_loops       = MAX_LOOPS,
-        trunc_loops     = TRUNC_LOOPS,
-        dt              = DT,
-        lam             = LAM,
-        expansion_ratio = EXPANSION_RATIO,
-        conv_kernel_size= CONV_KERNEL,
+        vocab_size       = VOCAB_SIZE,
+        d_model          = D_MODEL,
+        d_spectral       = D_SPECTRAL,
+        num_layers       = NUM_LAYERS,
+        loops            = LOOPS,
+        H_cycles         = H_CYCLES,
+        L_cycles         = L_CYCLES,
+        dt               = DT,
+        kernel_power     = KERNEL_POWER,
+        expansion_ratio  = EXPANSION_RATIO,
+        conv_kernel_size = CONV_KERNEL,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -469,30 +529,35 @@ if __name__ == "__main__":
 
     # ── 더미 입력 ─────────────────────────────────────────────────────
     input_ids = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
+    target    = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
     print(f"Input shape: {input_ids.shape}")  # [B, N]
 
-    # ── 순전파 ────────────────────────────────────────────────────────
+    # ── Carry 기반 다중 Forward ───────────────────────────────────────
     model.train()
-    logits_list, halt_probs_list = model(input_ids)
+    carry = model.initial_carry(BATCH_SIZE, SEQ_LEN, device)
+    batch = (input_ids, target)
 
-    print(f"\nGradient-tracking loops: {len(logits_list)}")
-    for i, (logits, p_halt) in enumerate(zip(logits_list, halt_probs_list)):
-        loop_idx = TRUNC_LOOPS + 1 + i
+    # ── Deep Supervision: 매 루프마다 loss + backward 누적 ─────────────
+    print(f"\nRunning {LOOPS} outer loops (H_cycles={H_CYCLES}, L_cycles={L_CYCLES}):")
+    print("Deep Supervision: loss.backward() at EVERY loop step")
+
+    for t in range(LOOPS):
+        carry, logits, halt_logits = model(carry, batch)
         print(
-            f"  Loop {loop_idx:2d} | "
+            f"  Loop {t+1:2d} | "
             f"logits: {tuple(logits.shape)} | "
-            f"p_halt: {p_halt.squeeze().tolist()}"
+            f"halt_logits: {halt_logits.squeeze().tolist()} | "
+            f"halted: {carry.halted.tolist()} | "
+            f"steps: {carry.steps.tolist()}"
         )
 
-    # ── 간단한 역전파 테스트 ──────────────────────────────────────────
-    # 마지막 루프 로짓으로 cross-entropy loss 계산
-    target = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(device)
-    final_logits = logits_list[-1]   # [B, N, vocab_size]
+        # 매 루프마다 loss 계산 + backward (gradient 누적)
+        loss = F.cross_entropy(
+            logits.reshape(-1, VOCAB_SIZE),
+            target.reshape(-1),
+        ) / LOOPS  # 루프 수로 나눠서 gradient 스케일 조정
+        loss.backward()
+        print(f"    → loss={loss.item() * LOOPS:.4f}, backward OK (grad accumulated)")
 
-    loss = F.cross_entropy(
-        final_logits.reshape(-1, VOCAB_SIZE),   # [B*N, vocab_size]
-        target.reshape(-1),                      # [B*N]
-    )
-    loss.backward()
-    print(f"\nCross-Entropy Loss: {loss.item():.4f}")
-    print("Backward pass: OK")
+    print(f"\nAll {LOOPS} loops completed. Gradient accumulated from every step.")
+    print("Ready for optimizer.step()")
