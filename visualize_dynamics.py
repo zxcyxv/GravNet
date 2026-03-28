@@ -37,7 +37,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", default="data/sudoku-extreme-1k-aug-1000")
     parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--d_spectral", type=int, default=64)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--train_steps", type=int, default=1000)
     parser.add_argument("--checkpoint", type=str, default=None, help="저장된 모델 가중치 (예: checkpoints/best.pt)")
@@ -56,20 +56,19 @@ def main():
         ckpt = torch.load(args.checkpoint, map_location=device)
         ckpt_args = ckpt.get("args", {})
         if ckpt_args:
-            print(f"Loaded config from checkpoint: d_model={ckpt_args.get('d_model')}, d_spectral={ckpt_args.get('d_spectral')}")
+            print(f"Loaded config from checkpoint: d_model={ckpt_args.get('d_model')}, num_heads={ckpt_args.get('num_heads')}")
             args.d_model = ckpt_args.get("d_model", args.d_model)
-            args.d_spectral = ckpt_args.get("d_spectral", args.d_spectral)
+            args.num_heads = ckpt_args.get("num_heads", args.num_heads)
 
     model = AMKPDModel(
         vocab_size=meta["vocab_size"],
         d_model=args.d_model,
-        d_spectral=args.d_spectral,
+        num_heads=args.num_heads,
         num_layers=ckpt_args.get("num_layers", 3),
         loops=ckpt_args.get("loops", 6),
         H_cycles=ckpt_args.get("H_cycles", 2),
         L_cycles=ckpt_args.get("L_cycles", 1),
         kernel_power=ckpt_args.get("kernel_power", 2),
-        use_w_v=ckpt_args.get("use_w_v", False),
     ).to(device)
 
     # Fake train args
@@ -106,11 +105,10 @@ def main():
                     carry = model.initial_carry(inputs.shape[0], seq_len, device)
                 batch = (inputs, labels)
                 optimizer.zero_grad()
-                # Deep Supervision: 매 외부 루프마다 loss + backward 누적
-                for _t in range(t_args.loops):
-                    carry, logits, halt_logits = model(carry, batch)
-                    loss, _ = compute_loss(logits, halt_logits, carry.current_labels, t_args)
-                    (loss / t_args.loops).backward()
+                # 1 batch = 1 forward (URM 패턴, carry가 배치 간 상태 전달)
+                carry, logits, q_logits = model(carry, batch)
+                loss, _ = compute_loss(logits, q_logits, carry.current_labels, t_args)
+                loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
@@ -187,11 +185,10 @@ def main():
     n_jacobian_steps = len(global_Q) - 1
     for l in range(n_jacobian_steps):
         Q_l = global_Q[l][0:1].to(device).detach().clone().requires_grad_(True)
-        # X 주입 후 첫 번째 블록 야코비안 계산 (URM L_cycle 패턴)
-        Q_injected = Q_l + X_input
+        # 첫 번째 블록 야코비안 계산 (X는 블록 내부에서 주입)
         model.blocks[0].viz_m = []
         with torch.enable_grad():
-            _ = model.blocks[0](Q_injected)
+            _ = model.blocks[0](Q_l, X_input)
             m_vec = model.blocks[0].viz_m[-1]
 
             norm_sq_sum = 0
@@ -217,12 +214,10 @@ def main():
 
     with torch.no_grad():
         for l in range(n_jacobian_steps):
-            # L_cycle: X 주입 + 블록 통과
-            Q_orig = Q_orig + X_input
-            Q_pert = Q_pert + X_perturbed
+            # L_cycle: 블록 통과 (X는 블록 내부에서 주입)
             for block in model.blocks:
-                Q_orig = block(Q_orig)
-                Q_pert = block(Q_pert)
+                Q_orig = block(Q_orig, X_input)
+                Q_pert = block(Q_pert, X_input)
 
             delta_Q = torch.norm(Q_pert - Q_orig, dim=-1).mean().item()
 

@@ -1,22 +1,11 @@
 """
-train.py — AMK-PD 훈련 스크립트
+train_urm.py — URM 훈련 스크립트
 
-속도 최적화:
-  - torch.compile (reduce-overhead 모드, 선택적)
-  - Mixed precision: bfloat16 / float16 + GradScaler
-  - Fused AdamW (CUDA 한정)
-  - Gradient accumulation
-  - cudnn.benchmark
-  - GPU-side 벡터화 증강 (for-loop 없음)
-  - pin_memory + persistent_workers DataLoader
-
-모니터링:
-  - 스텝별: loss(main/halt), token_acc, puzzle_acc, avg_steps, grad_norm, lr, 처리량, ETA
-  - 평가 시: 전체 test 셋 carry 기반 다중 forward 평가
+train.py (AMK-PD)와 동일한 인터페이스, 동일한 로그 포맷.
+공정 비교를 위해 동일한 옵티마이저/스케줄러/데이터셋 사용.
 
 사용 예시:
-  uv run python train.py --d_model 128 --batch_size 256 --epochs 10
-  uv run python train.py --compile --dtype bfloat16 --augment --grad_accum 2
+  uv run python train_urm.py --d_model 384 --num_heads 8 --num_layers 4 --batch_size 64 --loops 16 --H_cycles 2 --L_cycles 6
 """
 
 import argparse
@@ -32,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from amkpd_model import AMKPDModel, AMKPDCarry
+from urm_model import URMModel, URMCarry
 from dataset import create_dataloaders, vectorized_sudoku_augment
 
 
@@ -42,7 +31,7 @@ from dataset import create_dataloaders, vectorized_sudoku_augment
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Train AMK-PD on Sudoku",
+        description="Train URM on Sudoku",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -53,21 +42,18 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--num_workers", type=int, default=0,
                    help="DataLoader 워커 수 (Windows 는 0 권장)")
     g.add_argument("--augment",     action="store_true",
-                   help="GPU-side 온라인 증강 활성화 (이미 증강된 train 셋에 추가 다양성)")
+                   help="GPU-side 온라인 증강 활성화")
 
     # ── 모델 아키텍처 ─────────────────────────────────────────────────────
     g = p.add_argument_group("Model")
-    g.add_argument("--d_model",         type=int,   default=128,  help="은닉 차원 d")
-    g.add_argument("--num_heads",       type=int,   default=8,    help="멀티헤드 어텐션 헤드 수")
-    g.add_argument("--num_layers",      type=int,   default=2,    help="K: L_cycle당 블록 수")
-    g.add_argument("--loops",           type=int,   default=16,    help="외부 루프 최대 횟수 (carry 재호출)")
+    g.add_argument("--d_model",         type=int,   default=512,  help="은닉 차원 d")
+    g.add_argument("--num_heads",       type=int,   default=8,    help="어텐션 헤드 수")
+    g.add_argument("--num_layers",      type=int,   default=4,    help="블록 수")
+    g.add_argument("--loops",           type=int,   default=16,   help="외부 루프 최대 횟수")
     g.add_argument("--H_cycles",        type=int,   default=2,    help="중간 루프 (H-1회 no_grad + 1회 grad)")
-    g.add_argument("--L_cycles",        type=int,   default=6,    help="내부 루프 (X 주입 + 블록 통과)")
-    g.add_argument("--dt",              type=float, default=1.0,  help="Euler 스텝 초기값 (학습)")
-    g.add_argument("--expansion_ratio", type=int,   default=4,    help="ConvSwiGLU 팽창 비율 m")
-    g.add_argument("--conv_kernel",     type=int,   default=2,    help="Depthwise conv 커널 크기")
-    g.add_argument("--kernel_power",    type=int,   default=4,    help="인력 행렬 다항식 거듭제곱 차수 (1=선형, 2=이차, 3=삼차)")
-    g.add_argument("--full_grad",       action="store_true",      help="H_cycles burn-in에서 no_grad 끄기 (전체 gradient 추적)")
+    g.add_argument("--L_cycles",        type=int,   default=6,    help="내부 루프")
+    g.add_argument("--expansion",       type=float, default=4,    help="MLP 팽창 비율")
+    g.add_argument("--full_grad",       action="store_true",      help="H_cycles burn-in에서 no_grad 끄기")
 
     # ── 훈련 ──────────────────────────────────────────────────────────────
     g = p.add_argument_group("Training")
@@ -82,25 +68,25 @@ def parse_args() -> argparse.Namespace:
     # ── Loss 계수 ─────────────────────────────────────────────────────────
     g = p.add_argument_group("Loss")
     g.add_argument("--halt_loss_coef", type=float, default=0.01,
-                   help="Halting BCE 손실 가중치 (조기 정지 억제)")
+                   help="Halting BCE 손실 가중치")
 
     # ── 속도 ──────────────────────────────────────────────────────────────
     g = p.add_argument_group("Speed")
     g.add_argument("--compile", action="store_true",
-                   help="torch.compile 활성화 (C++ 컴파일러 필요)")
+                   help="torch.compile 활성화")
     g.add_argument("--dtype",   choices=["float32", "bfloat16", "float16"], default="float32",
                    help="Mixed precision dtype")
 
     # ── 로깅 & 체크포인팅 ─────────────────────────────────────────────────
     g = p.add_argument_group("Logging")
-    g.add_argument("--checkpoint_dir", default="checkpoints")
-    g.add_argument("--log_interval",   type=int, default=50,  help="상세 로그 출력 주기 (옵티마이저 스텝)")
-    g.add_argument("--eval_interval",  type=int, default=5000, help="테스트셋 평가 주기 (옵티마이저 스텝)")
+    g.add_argument("--checkpoint_dir", default="checkpoints_urm")
+    g.add_argument("--log_interval",   type=int, default=50,  help="상세 로그 출력 주기")
+    g.add_argument("--eval_interval",  type=int, default=5000, help="테스트셋 평가 주기")
     g.add_argument("--save_top_k",     type=int, default=3,   help="상위 K개 체크포인트 보존")
     g.add_argument("--resume",         type=str, default=None, help="재개할 체크포인트 경로")
 
     g = p.add_argument_group("Debug")
-    g.add_argument("--debug_nan",      action="store_true",   help="NaN/Inf 감지 훅 및 안티-익셉션 활성화")
+    g.add_argument("--debug_nan",      action="store_true")
 
     g.add_argument("--seed", type=int, default=42)
 
@@ -108,7 +94,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 옵티마이저 & 스케줄러
+# 옵티마이저 & 스케줄러 (train.py와 동일)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_optimizer_and_scheduler(
@@ -116,18 +102,11 @@ def build_optimizer_and_scheduler(
     args:        argparse.Namespace,
     total_steps: int,
 ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-    """
-    - Bias / LayerNorm / 1D 파라미터 → weight_decay=0
-    - 나머지 → weight_decay=args.weight_decay
-    - CUDA 에서는 fused AdamW 사용 (CUDA 커널 병합으로 속도 향상)
-    - Cosine decay + linear warmup 스케줄러
-    """
     decay_params, no_decay_params = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # 1D 파라미터(bias, norm weight/bias, spectral bias 등) 는 decay 제외
-        if param.ndim <= 1 or any(k in name for k in ("bias", "norm")):
+        if param.ndim <= 1 or any(k in name for k in ("bias",)):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -137,7 +116,6 @@ def build_optimizer_and_scheduler(
         {"params": no_decay_params, "weight_decay": 0.0},
     ]
 
-    # Fused AdamW: CUDA 에서만 사용 (단일 커널로 파라미터 업데이트)
     use_fused = torch.cuda.is_available()
     optim_kwargs: dict = {"fused": True} if use_fused else {}
     optimizer = torch.optim.AdamW(
@@ -148,7 +126,6 @@ def build_optimizer_and_scheduler(
         **optim_kwargs,
     )
 
-    # Cosine decay with linear warmup
     def lr_lambda(step: int) -> float:
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
@@ -160,24 +137,15 @@ def build_optimizer_and_scheduler(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loss
+# Loss (train.py와 동일)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_loss(
-    logits:            torch.Tensor,                    # (B, 81, V)
-    q_logits:          Tuple[torch.Tensor, torch.Tensor],  # ((B,), (B,))
-    labels:            torch.Tensor,                    # (B, 81)
+    logits:            torch.Tensor,
+    q_logits:          Tuple[torch.Tensor, torch.Tensor],
+    labels:            torch.Tensor,
     args,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    total = CE(logits, labels) + halt_coef × Q_loss
-
-    Q_loss: URM Q-learning 근사.
-      - 현재 스텝의 per-sample 정확도를 보상(reward)으로 사용
-      - q_halt가 높아야 할 때(정확): q_halt_target = +acc
-      - q_continue가 높아야 할 때(부정확): q_halt_target = -(1-acc)
-      - q_halt - q_continue의 margin을 reward로 맞춤
-    """
     B, N = labels.shape
     V    = logits.shape[-1]
     q_halt_logits, q_continue_logits = q_logits
@@ -193,15 +161,12 @@ def compute_loss(
     q_loss = torch.zeros(1, device=total.device).squeeze()
     if halt_coef > 0 and torch.isfinite(q_halt_logits).all():
         with torch.no_grad():
-            # per-sample 정확도를 reward로 사용
             mask = labels != 0
-            preds = logits.argmax(dim=-1)           # [B, N]
-            acc = ((preds == labels) & mask).float().sum(-1) / mask.float().sum(-1).clamp(min=1)  # [B]
-            # reward: [0,1] → [-1,+1] (q_halt가 높으면 멈춰도 됨 = 정확)
-            q_target = 2 * acc - 1                  # [B]
+            preds = logits.argmax(dim=-1)
+            acc = ((preds == labels) & mask).float().sum(-1) / mask.float().sum(-1).clamp(min=1)
+            q_target = 2 * acc - 1
 
-        # q_halt - q_continue 의 margin이 q_target과 일치하도록 학습
-        q_margin = q_halt_logits - q_continue_logits  # [B]
+        q_margin = q_halt_logits - q_continue_logits
         q_loss = F.mse_loss(q_margin, q_target)
         total = total + halt_coef * q_loss
 
@@ -214,24 +179,18 @@ def compute_loss(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics
+# Metrics (train.py와 동일)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def compute_metrics(
-    logits: torch.Tensor,    # (B, 81, V)
-    labels: torch.Tensor,    # (B, 81)
+    logits: torch.Tensor,
+    labels: torch.Tensor,
 ) -> Dict[str, object]:
-    """
-    - token_acc  : 81개 셀 중 맞춘 비율
-    - puzzle_acc : 81개 전부 맞춰야 1
-    """
     mask    = labels != 0
     n_valid = mask.float().sum()
-
     preds   = logits.argmax(dim=-1)
     correct = (preds == labels) & mask
-
     return {
         "token_acc":  (correct.float().sum() / n_valid).item(),
         "puzzle_acc": (correct | ~mask).all(dim=1).float().mean().item(),
@@ -239,7 +198,7 @@ def compute_metrics(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Evaluation
+# Evaluation (train.py와 동일)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -250,7 +209,6 @@ def evaluate(
     args:         argparse.Namespace,
     autocast_ctx,
 ) -> Dict[str, float]:
-    """carry 기반 다중 forward로 테스트셋 평가."""
     model.eval()
 
     total_loss       = 0.0
@@ -269,12 +227,10 @@ def evaluate(
         carry = model.initial_carry(B, seq_len, device)
         batch = (inputs, labels)
 
-        # 전체 loops 만큼 forward 반복
         for _ in range(args.loops):
             with autocast_ctx:
                 carry, logits, q_logits = model(carry, batch)
 
-        # 최종 logits로 평가
         _, loss_log = compute_loss(logits, q_logits, carry.current_labels, args)
         total_loss += loss_log["loss"]
 
@@ -298,26 +254,21 @@ def evaluate(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Checkpoint 관리
+# Checkpoint 관리 (train.py와 동일)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CheckpointManager:
-    """상위 K개 체크포인트를 puzzle_acc 기준으로 보존합니다."""
-
     def __init__(self, ckpt_dir: str, save_top_k: int = 3):
         self.ckpt_dir   = Path(ckpt_dir)
         self.save_top_k = save_top_k
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self._saved: List[Tuple[float, Path]] = []  # (score, path)
+        self._saved: List[Tuple[float, Path]] = []
 
     def save(self, state: dict, score: float, filename: str) -> None:
         path = self.ckpt_dir / filename
         torch.save(state, path)
-
         self._saved.append((score, path))
-        self._saved.sort(key=lambda x: -x[0])  # 내림차순
-
-        # Top-K 초과 시 최하위 삭제 (best.pt 는 제외)
+        self._saved.sort(key=lambda x: -x[0])
         while len(self._saved) > self.save_top_k:
             _, old_path = self._saved.pop()
             if old_path.exists() and old_path.name != "best.pt":
@@ -336,7 +287,7 @@ def train(args: argparse.Namespace) -> None:
         torch.cuda.manual_seed_all(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True  # 고정된 입력 크기(81)에서 최적 CUDA 커널 자동 선택
+    torch.backends.cudnn.benchmark = True
     print(f"Device : {device}")
 
     # ── 데이터 ────────────────────────────────────────────────────────────
@@ -352,18 +303,15 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ── 모델 ──────────────────────────────────────────────────────────────
-    model = AMKPDModel(
-        vocab_size       = meta["vocab_size"],
-        d_model          = args.d_model,
-        num_heads        = args.num_heads,
-        num_layers       = args.num_layers,
-        loops            = args.loops,
-        H_cycles         = args.H_cycles,
-        L_cycles         = args.L_cycles,
-        dt               = args.dt,
-        kernel_power     = args.kernel_power,
-        expansion_ratio  = args.expansion_ratio,
-        conv_kernel_size = args.conv_kernel,
+    model = URMModel(
+        vocab_size  = meta["vocab_size"],
+        d_model     = args.d_model,
+        num_heads   = args.num_heads,
+        num_layers  = args.num_layers,
+        loops       = args.loops,
+        H_cycles    = args.H_cycles,
+        L_cycles    = args.L_cycles,
+        expansion   = args.expansion,
     ).to(device)
     if args.full_grad:
         model.burn_in_no_grad = False
@@ -392,22 +340,12 @@ def train(args: argparse.Namespace) -> None:
                     if isinstance(out, torch.Tensor) and (torch.isnan(out).any() or torch.isinf(out).any()):
                         print(f"\n[DEBUG] NaN/Inf in forward output[{i}] of {module.__class__.__name__}")
 
-        def nan_backward_hook(module, grad_input, grad_output):
-            for i, g in enumerate(grad_input):
-                if isinstance(g, torch.Tensor) and (torch.isnan(g).any() or torch.isinf(g).any()):
-                    print(f"\n[DEBUG] NaN/Inf in backward grad_input[{i}] of {module.__class__.__name__}")
-            for i, g in enumerate(grad_output):
-                if isinstance(g, torch.Tensor) and (torch.isnan(g).any() or torch.isinf(g).any()):
-                    print(f"\n[DEBUG] NaN/Inf in backward grad_output[{i}] of {module.__class__.__name__}")
-
         for name, m in model.named_modules():
             m.register_forward_hook(nan_forward_hook)
-            m.register_full_backward_hook(nan_backward_hook)
 
     # ── Mixed precision ───────────────────────────────────────────────────
     _dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
     amp_dtype  = _dtype_map[args.dtype]
-    # bfloat16 은 CPU 에서도 지원; float16 은 CUDA 전용
     use_amp    = amp_dtype != torch.float32
     if use_amp and amp_dtype == torch.float16 and device.type != "cuda":
         print("float16 is CUDA-only — falling back to float32")
@@ -418,7 +356,6 @@ def train(args: argparse.Namespace) -> None:
         dtype       = amp_dtype,
         enabled     = use_amp,
     )
-    # GradScaler: float16 에서만 필요 (bfloat16 은 동적 범위가 충분)
     use_scaler = use_amp and (amp_dtype == torch.float16)
     scaler     = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
@@ -453,7 +390,6 @@ def train(args: argparse.Namespace) -> None:
     ckpt_mgr    = CheckpointManager(args.checkpoint_dir, args.save_top_k)
     total_start = time.time()
 
-    # 처리량 추적: 최근 100 마이크로-스텝의 이동 평균
     step_times:   deque = deque(maxlen=100)
     step_samples: deque = deque(maxlen=100)
     last_grad_norm = 0.0
@@ -465,7 +401,6 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         optimizer.zero_grad()
 
-        # 에폭마다 carry 리셋
         carry = model.initial_carry(args.batch_size, seq_len, device)
 
         epoch_loss  = 0.0
@@ -482,22 +417,18 @@ def train(args: argparse.Namespace) -> None:
         for batch_idx, (inputs, labels) in pbar:
             t0 = time.perf_counter()
 
-            inputs = inputs.to(device, non_blocking=True)  # (B, 81)
-            labels = labels.to(device, non_blocking=True)  # (B, 81)
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
-            # 배치 크기가 달라지면 carry 재초기화 (마지막 배치 등)
             if inputs.shape[0] != carry.current_hidden.shape[0]:
                 carry = model.initial_carry(inputs.shape[0], seq_len, device)
 
-            # GPU-side 벡터화 온라인 증강 (선택적)
             if args.augment:
                 inputs, labels = vectorized_sudoku_augment(inputs, labels)
 
             batch = (inputs, labels)
 
-            # ── Forward: 배치당 1회 (URM pretrain.py:544 패턴) ────────────
-            # carry가 배치 간에 지속되므로 데이터로더 순회 자체가 외부 루프.
-            # 같은 배치를 여러 번 때리면 transient를 죽이고 state collapse 유발.
+            # ── Forward ───────────────────────────────────────────────
             with autocast_ctx:
                 carry, logits, q_logits = model(carry, batch)
                 loss, loss_log = compute_loss(
@@ -505,26 +436,16 @@ def train(args: argparse.Namespace) -> None:
                 )
                 scaled_loss = loss / args.grad_accum
 
-            # ── NaN 감지 ──────────────────────────────────────────────────
+            # ── NaN 감지 ──────────────────────────────────────────────
             if math.isnan(loss_log["loss"]):
                 tqdm.write(f"\n[FATAL] NaN loss detected at global step {global_step}!")
-                has_nan_param = False
-                for name, p in model.named_parameters():
-                    if p.isnan().any():
-                        tqdm.write(f"Parameter '{name}' contains NaN.")
-                        has_nan_param = True
-                    if p.grad is not None and p.grad.isnan().any():
-                        tqdm.write(f"Gradient of '{name}' contains NaN.")
-                if not has_nan_param:
-                    tqdm.write("All parameters are finite. Forward pass exploded!")
-                tqdm.write("Exiting training.")
                 import sys
                 sys.exit(1)
 
-            # ── Backward ──────────────────────────────────────────────────
+            # ── Backward ──────────────────────────────────────────────
             scaler.scale(scaled_loss).backward()
 
-            # ── 옵티마이저 스텝 (grad_accum 마이크로-스텝마다) ─────────────
+            # ── 옵티마이저 스텝 ───────────────────────────────────────
             is_update_step = (batch_idx + 1) % args.grad_accum == 0
             if is_update_step:
                 scaler.unscale_(optimizer)
@@ -537,20 +458,20 @@ def train(args: argparse.Namespace) -> None:
                 scheduler.step()
                 global_step += 1
 
-            # ── 처리량 측정 ───────────────────────────────────────────────
+            # ── 처리량 측정 ───────────────────────────────────────────
             elapsed = time.perf_counter() - t0
             step_times.append(elapsed)
             step_samples.append(inputs.shape[0])
             throughput = sum(step_samples) / max(1e-9, sum(step_times))
 
-            # ── 배치 지표 (마지막 루프의 logits 기준) ─────────────────────
+            # ── 배치 지표 ─────────────────────────────────────────────
             with torch.no_grad():
                 m = compute_metrics(logits, carry.current_labels)
 
             epoch_loss  += loss_log["loss"]
             epoch_steps += 1
 
-            # ── tqdm postfix ──────────────────────────────────────────────
+            # ── tqdm postfix ──────────────────────────────────────────
             current_lr = optimizer.param_groups[0]["lr"]
             avg_steps  = carry.steps.float().mean().item()
 
@@ -565,7 +486,7 @@ def train(args: argparse.Namespace) -> None:
                 refresh  = False,
             )
 
-            # ── 상세 로그 ─────────────────────────────────────────────────
+            # ── 상세 로그 ─────────────────────────────────────────────
             if is_update_step and global_step % args.log_interval == 0:
                 elapsed_total = time.time() - total_start
                 eta_sec       = (elapsed_total / max(1, global_step)) * max(0, total_steps - global_step)
@@ -577,9 +498,6 @@ def train(args: argparse.Namespace) -> None:
                     gb = torch.cuda.memory_allocated(device) / 1024 ** 3
                     mem_str = f"  mem={gb:.2f}GB"
 
-                dt_vals = [F.softplus(b.dt).item() for b in model.blocks]
-                dt_str = "[" + " ".join(f"{v:.3f}" for v in dt_vals) + "]"
-
                 tqdm.write(
                     f"[{global_step:6d}/{total_steps}]"
                     f"  loss={loss_log['loss']:.4f}"
@@ -590,13 +508,12 @@ def train(args: argparse.Namespace) -> None:
                     f"  avg_steps={avg_steps:.1f}"
                     f"  lr={current_lr:.2e}"
                     f"  gnorm={last_grad_norm:.3f}"
-                    f"  dt={dt_str}"
                     f"  {throughput:.0f}samp/s"
                     f"  ETA {h:02d}:{m_:02d}:{s_:02d}"
                     f"{mem_str}"
                 )
 
-            # ── 평가 & 체크포인팅 ─────────────────────────────────────────
+            # ── 평가 & 체크포인팅 ─────────────────────────────────────
             if is_update_step and global_step > 0 and global_step % args.eval_interval == 0:
                 eval_res = evaluate(model, test_loader, device, args, autocast_ctx)
                 model.train()
@@ -631,7 +548,7 @@ def train(args: argparse.Namespace) -> None:
 
                 fname = f"step{global_step:06d}_pacc{puzzle_acc:.4f}.pt"
                 ckpt_mgr.save(state, puzzle_acc, fname)
-                tqdm.write(f"  [ckpt] saved → checkpoints/{fname}")
+                tqdm.write(f"  [ckpt] saved → {args.checkpoint_dir}/{fname}")
 
                 if is_best:
                     best_path = Path(args.checkpoint_dir) / "best.pt"
@@ -661,10 +578,8 @@ def train(args: argparse.Namespace) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Windows multiprocessing 보호 (num_workers > 0 시 필수)
     args = parse_args()
 
-    # 설정 저장
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(args.checkpoint_dir) / "config.json", "w") as f:
         json.dump(vars(args), f, indent=2)

@@ -11,8 +11,8 @@ train.py — AMK-PD 훈련 스크립트
   - pin_memory + persistent_workers DataLoader
 
 모니터링:
-  - 스텝별: loss(main/halt), token_acc, puzzle_acc, avg_steps, grad_norm, lr, 처리량, ETA
-  - 평가 시: 전체 test 셋 carry 기반 다중 forward 평가
+  - 스텝별: loss(main/aux/act), token_acc, puzzle_acc, grad_norm, lr, 처리량, ETA
+  - 평가 시: 전체 test 셋 + 루프별 puzzle_acc 분해
 
 사용 예시:
   uv run python train.py --d_model 128 --batch_size 256 --epochs 10
@@ -25,14 +25,14 @@ import math
 import time
 from collections import deque
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from amkpd_model import AMKPDModel, AMKPDCarry
+from amkpd_v1_model import AMKPDModel
 from dataset import create_dataloaders, vectorized_sudoku_augment
 
 
@@ -58,16 +58,14 @@ def parse_args() -> argparse.Namespace:
     # ── 모델 아키텍처 ─────────────────────────────────────────────────────
     g = p.add_argument_group("Model")
     g.add_argument("--d_model",         type=int,   default=128,  help="은닉 차원 d")
-    g.add_argument("--num_heads",       type=int,   default=8,    help="멀티헤드 어텐션 헤드 수")
-    g.add_argument("--num_layers",      type=int,   default=2,    help="K: L_cycle당 블록 수")
-    g.add_argument("--loops",           type=int,   default=16,    help="외부 루프 최대 횟수 (carry 재호출)")
-    g.add_argument("--H_cycles",        type=int,   default=2,    help="중간 루프 (H-1회 no_grad + 1회 grad)")
-    g.add_argument("--L_cycles",        type=int,   default=6,    help="내부 루프 (X 주입 + 블록 통과)")
-    g.add_argument("--dt",              type=float, default=1.0,  help="Euler 스텝 초기값 (학습)")
+    g.add_argument("--num_heads",       type=int,   default=8,    help="어텐션 헤드 수 H")
+    g.add_argument("--num_layers",      type=int,   default=3,    help="K: 루프당 블록 수")
+    g.add_argument("--max_loops",       type=int,   default=6,    help="M: 최대 거시 루프")
+    g.add_argument("--trunc_loops",     type=int,   default=3,    help="N_trunc: no_grad 루프 수")
+    g.add_argument("--dt",              type=float, default=0.1,  help="Euler 스텝 초기값 (학습)")
     g.add_argument("--expansion_ratio", type=int,   default=4,    help="ConvSwiGLU 팽창 비율 m")
-    g.add_argument("--conv_kernel",     type=int,   default=2,    help="Depthwise conv 커널 크기")
-    g.add_argument("--kernel_power",    type=int,   default=4,    help="인력 행렬 다항식 거듭제곱 차수 (1=선형, 2=이차, 3=삼차)")
-    g.add_argument("--full_grad",       action="store_true",      help="H_cycles burn-in에서 no_grad 끄기 (전체 gradient 추적)")
+    g.add_argument("--conv_kernel",     type=int,   default=3,    help="Depthwise conv 커널 크기")
+    g.add_argument("--kernel_power",    type=int,   default=2,    help="다항식 커널 지수 p")
 
     # ── 훈련 ──────────────────────────────────────────────────────────────
     g = p.add_argument_group("Training")
@@ -81,8 +79,10 @@ def parse_args() -> argparse.Namespace:
 
     # ── Loss 계수 ─────────────────────────────────────────────────────────
     g = p.add_argument_group("Loss")
-    g.add_argument("--halt_loss_coef", type=float, default=0.01,
-                   help="Halting BCE 손실 가중치 (조기 정지 억제)")
+    g.add_argument("--aux_loss_coef", type=float, default=0.3,
+                   help="중간 루프 CE 손실 가중치 (0 = 비활성)")
+    g.add_argument("--act_loss_coef", type=float, default=0.01,
+                   help="ACT halting BCE 손실 가중치 (0 = 비활성)")
 
     # ── 속도 ──────────────────────────────────────────────────────────────
     g = p.add_argument_group("Speed")
@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
 
     # ── 로깅 & 체크포인팅 ─────────────────────────────────────────────────
     g = p.add_argument_group("Logging")
-    g.add_argument("--checkpoint_dir", default="checkpoints")
+    g.add_argument("--checkpoint_dir", default="checkpoints_v1")
     g.add_argument("--log_interval",   type=int, default=50,  help="상세 로그 출력 주기 (옵티마이저 스텝)")
     g.add_argument("--eval_interval",  type=int, default=5000, help="테스트셋 평가 주기 (옵티마이저 스텝)")
     g.add_argument("--save_top_k",     type=int, default=3,   help="상위 K개 체크포인트 보존")
@@ -164,51 +164,56 @@ def build_optimizer_and_scheduler(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_loss(
-    logits:            torch.Tensor,                    # (B, 81, V)
-    q_logits:          Tuple[torch.Tensor, torch.Tensor],  # ((B,), (B,))
-    labels:            torch.Tensor,                    # (B, 81)
-    args,
+    logits_list:     List[torch.Tensor],  # [(B, 81, V), ...]
+    halt_probs_list: List[torch.Tensor],  # [(B, 1), ...]
+    labels:          torch.Tensor,         # (B, 81)
+    args:            argparse.Namespace,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    total = CE(logits, labels) + halt_coef × Q_loss
+    전체 손실 = main_CE  +  aux_coef × aux_CE  +  act_coef × act_BCE
 
-    Q_loss: URM Q-learning 근사.
-      - 현재 스텝의 per-sample 정확도를 보상(reward)으로 사용
-      - q_halt가 높아야 할 때(정확): q_halt_target = +acc
-      - q_continue가 높아야 할 때(부정확): q_halt_target = -(1-acc)
-      - q_halt - q_continue의 margin을 reward로 맞춤
+    - main_CE : 마지막 루프 logits 에 대한 Cross-Entropy
+    - aux_CE  : gradient-tracking 구간 중간 루프들의 CE 평균
+    - act_BCE : ACT 정지 확률 정규화 (마지막 루프→1, 나머지→0)
     """
-    B, N = labels.shape
-    V    = logits.shape[-1]
-    q_halt_logits, q_continue_logits = q_logits
+    B, N    = labels.shape
+    V       = logits_list[0].shape[-1]
+    flat_lbl = labels.reshape(B * N)
 
-    main_loss = F.cross_entropy(
-        logits.reshape(B * N, V),
-        labels.reshape(B * N),
-        ignore_index=0,
-    )
-    total = main_loss
+    def ce(logits: torch.Tensor) -> torch.Tensor:
+        return F.cross_entropy(
+            logits.reshape(B * N, V),
+            flat_lbl,
+            ignore_index=0,   # PAD (레이블에 없으므로 사실상 no-op)
+        )
 
-    halt_coef = getattr(args, 'halt_loss_coef', 0.01)
-    q_loss = torch.zeros(1, device=total.device).squeeze()
-    if halt_coef > 0 and torch.isfinite(q_halt_logits).all():
-        with torch.no_grad():
-            # per-sample 정확도를 reward로 사용
-            mask = labels != 0
-            preds = logits.argmax(dim=-1)           # [B, N]
-            acc = ((preds == labels) & mask).float().sum(-1) / mask.float().sum(-1).clamp(min=1)  # [B]
-            # reward: [0,1] → [-1,+1] (q_halt가 높으면 멈춰도 됨 = 정확)
-            q_target = 2 * acc - 1                  # [B]
+    # 메인 손실
+    main_loss = ce(logits_list[-1])
+    total     = main_loss
 
-        # q_halt - q_continue 의 margin이 q_target과 일치하도록 학습
-        q_margin = q_halt_logits - q_continue_logits  # [B]
-        q_loss = F.mse_loss(q_margin, q_target)
-        total = total + halt_coef * q_loss
+    # 보조 손실: 중간 루프 (마지막 루프 제외)
+    aux_loss = torch.zeros(1, device=total.device).squeeze()
+    if args.aux_loss_coef > 0 and len(logits_list) > 1:
+        aux_loss = torch.stack([ce(l) for l in logits_list[:-1]]).mean()
+        total    = total + args.aux_loss_coef * aux_loss
+
+    # ACT 정규화 손실
+    act_loss = torch.zeros(1, device=total.device).squeeze()
+    if args.act_loss_coef > 0 and len(halt_probs_list) > 1:
+        # halt_stack: (B, L) — 루프별 정지 확률
+        halt_stack  = torch.cat(halt_probs_list, dim=1)  # (B, L)
+        halt_target = torch.zeros_like(halt_stack)
+        halt_target[:, -1] = 1.0                          # 마지막 루프만 halting=1
+        # NaN/Inf 방어: Q 발산 시 halt_stack이 NaN이 될 수 있으므로 스킵
+        if torch.isfinite(halt_stack).all():
+            act_loss = F.binary_cross_entropy(halt_stack.clamp(1e-6, 1 - 1e-6), halt_target)
+        total    = total + args.act_loss_coef * act_loss
 
     log = {
         "loss":      total.item(),
         "main_loss": main_loss.item(),
-        "halt_loss": q_loss.item(),
+        "aux_loss":  aux_loss.item(),
+        "act_loss":  act_loss.item(),
     }
     return total, log
 
@@ -219,22 +224,32 @@ def compute_loss(
 
 @torch.no_grad()
 def compute_metrics(
-    logits: torch.Tensor,    # (B, 81, V)
-    labels: torch.Tensor,    # (B, 81)
+    logits_list: List[torch.Tensor],  # [(B, 81, V), ...]
+    labels:      torch.Tensor,         # (B, 81)
 ) -> Dict[str, object]:
     """
-    - token_acc  : 81개 셀 중 맞춘 비율
-    - puzzle_acc : 81개 전부 맞춰야 1
+    - token_acc  : 81개 셀 중 맞춘 비율 (최종 루프 기준)
+    - puzzle_acc : 81개 전부 맞춰야 1 (최종 루프 기준)
+    - per_loop_puzzle_acc : 루프별 puzzle_acc 리스트
     """
-    mask    = labels != 0
+    mask    = labels != 0       # (B, 81) — 항상 True (레이블에 PAD 없음)
     n_valid = mask.float().sum()
 
-    preds   = logits.argmax(dim=-1)
-    correct = (preds == labels) & mask
+    loop_puzzle_accs = []
+    for logits in logits_list:
+        preds          = logits.argmax(dim=-1)              # (B, 81)
+        correct        = (preds == labels) & mask           # (B, 81)
+        all_correct    = (correct | ~mask).all(dim=1)       # (B,)
+        loop_puzzle_accs.append(all_correct.float().mean().item())
+
+    # 최종 루프 기준 대표 지표
+    final_preds   = logits_list[-1].argmax(dim=-1)          # (B, 81)
+    final_correct = (final_preds == labels) & mask          # (B, 81)
 
     return {
-        "token_acc":  (correct.float().sum() / n_valid).item(),
-        "puzzle_acc": (correct | ~mask).all(dim=1).float().mean().item(),
+        "token_acc":           (final_correct.float().sum() / n_valid).item(),
+        "puzzle_acc":          (final_correct | ~mask).all(dim=1).float().mean().item(),
+        "per_loop_puzzle_acc": loop_puzzle_accs,
     }
 
 
@@ -250,7 +265,7 @@ def evaluate(
     args:         argparse.Namespace,
     autocast_ctx,
 ) -> Dict[str, float]:
-    """carry 기반 다중 forward로 테스트셋 평가."""
+    """테스트셋 전체를 순회하며 평균 지표를 반환합니다."""
     model.eval()
 
     total_loss       = 0.0
@@ -258,42 +273,43 @@ def evaluate(
     token_total      = 0.0
     puzzle_correct   = 0.0
     puzzle_total     = 0
-    total_steps_sum  = 0.0
+    loop_puzz_corr: Optional[List[float]] = None
 
     for inputs, labels in tqdm(loader, desc="  [eval]", leave=False, dynamic_ncols=True):
-        inputs = inputs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        B = inputs.shape[0]
-        seq_len = inputs.shape[1]
+        inputs = inputs.to(device, non_blocking=True)  # (B, 81)
+        labels = labels.to(device, non_blocking=True)  # (B, 81)
 
-        carry = model.initial_carry(B, seq_len, device)
-        batch = (inputs, labels)
+        with autocast_ctx:
+            logits_list, halt_probs_list = model(inputs)
 
-        # 전체 loops 만큼 forward 반복
-        for _ in range(args.loops):
-            with autocast_ctx:
-                carry, logits, q_logits = model(carry, batch)
-
-        # 최종 logits로 평가
-        _, loss_log = compute_loss(logits, q_logits, carry.current_labels, args)
+        _, loss_log = compute_loss(logits_list, halt_probs_list, labels, args)
         total_loss += loss_log["loss"]
 
-        m    = compute_metrics(logits, carry.current_labels)
-        mask = carry.current_labels != 0
+        m    = compute_metrics(logits_list, labels)
+        B    = inputs.shape[0]
+        mask = labels != 0
 
         token_correct  += m["token_acc"]  * mask.float().sum().item()
         token_total    += mask.float().sum().item()
         puzzle_correct += m["puzzle_acc"] * B
         puzzle_total   += B
-        total_steps_sum += carry.steps.float().sum().item()
+
+        lpa = m["per_loop_puzzle_acc"]
+        if loop_puzz_corr is None:
+            loop_puzz_corr = [0.0] * len(lpa)
+        for i, v in enumerate(lpa):
+            loop_puzz_corr[i] += v * B
 
     n_batches = max(1, len(loader))
     result = {
         "eval_loss":       total_loss / n_batches,
         "eval_token_acc":  token_correct / max(1.0, token_total),
         "eval_puzzle_acc": puzzle_correct / max(1, puzzle_total),
-        "eval_avg_steps":  total_steps_sum / max(1, puzzle_total),
     }
+    if loop_puzz_corr:
+        for i, v in enumerate(loop_puzz_corr):
+            result[f"eval_loop{i + 1}_puzzle_acc"] = v / max(1, puzzle_total)
+
     return result
 
 
@@ -357,16 +373,13 @@ def train(args: argparse.Namespace) -> None:
         d_model          = args.d_model,
         num_heads        = args.num_heads,
         num_layers       = args.num_layers,
-        loops            = args.loops,
-        H_cycles         = args.H_cycles,
-        L_cycles         = args.L_cycles,
+        max_loops        = args.max_loops,
+        trunc_loops      = args.trunc_loops,
         dt               = args.dt,
-        kernel_power     = args.kernel_power,
         expansion_ratio  = args.expansion_ratio,
         conv_kernel_size = args.conv_kernel,
+        kernel_power     = args.kernel_power,
     ).to(device)
-    if args.full_grad:
-        model.burn_in_no_grad = False
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Params : {n_params:,}")
@@ -458,15 +471,10 @@ def train(args: argparse.Namespace) -> None:
     step_samples: deque = deque(maxlen=100)
     last_grad_norm = 0.0
 
-    seq_len = meta["seq_len"]
-
     # ── Epoch 루프 ────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
         model.train()
         optimizer.zero_grad()
-
-        # 에폭마다 carry 리셋
-        carry = model.initial_carry(args.batch_size, seq_len, device)
 
         epoch_loss  = 0.0
         epoch_steps = 0
@@ -485,29 +493,20 @@ def train(args: argparse.Namespace) -> None:
             inputs = inputs.to(device, non_blocking=True)  # (B, 81)
             labels = labels.to(device, non_blocking=True)  # (B, 81)
 
-            # 배치 크기가 달라지면 carry 재초기화 (마지막 배치 등)
-            if inputs.shape[0] != carry.current_hidden.shape[0]:
-                carry = model.initial_carry(inputs.shape[0], seq_len, device)
-
             # GPU-side 벡터화 온라인 증강 (선택적)
             if args.augment:
                 inputs, labels = vectorized_sudoku_augment(inputs, labels)
 
-            batch = (inputs, labels)
-
-            # ── Forward: 배치당 1회 (URM pretrain.py:544 패턴) ────────────
-            # carry가 배치 간에 지속되므로 데이터로더 순회 자체가 외부 루프.
-            # 같은 배치를 여러 번 때리면 transient를 죽이고 state collapse 유발.
+            # ── Forward ───────────────────────────────────────────────────
             with autocast_ctx:
-                carry, logits, q_logits = model(carry, batch)
-                loss, loss_log = compute_loss(
-                    logits, q_logits, carry.current_labels, args
-                )
-                scaled_loss = loss / args.grad_accum
+                logits_list, halt_probs_list = model(inputs)
+                loss, loss_log = compute_loss(logits_list, halt_probs_list, labels, args)
+                loss = loss / args.grad_accum   # 그래디언트 누적 스케일링
 
-            # ── NaN 감지 ──────────────────────────────────────────────────
+            # ── NaN 발생 감지 및 종료 ────────────────────────────────────────
             if math.isnan(loss_log["loss"]):
                 tqdm.write(f"\n[FATAL] NaN loss detected at global step {global_step}!")
+                tqdm.write("--- Model Parameter Status ---")
                 has_nan_param = False
                 for name, p in model.named_parameters():
                     if p.isnan().any():
@@ -516,13 +515,13 @@ def train(args: argparse.Namespace) -> None:
                     if p.grad is not None and p.grad.isnan().any():
                         tqdm.write(f"Gradient of '{name}' contains NaN.")
                 if not has_nan_param:
-                    tqdm.write("All parameters are finite. Forward pass exploded!")
-                tqdm.write("Exiting training.")
+                    tqdm.write("All parameters are finite. Forward pass exploded! Please check activation scaling.")
+                tqdm.write("Exiting training to prevent further NaN propagation.")
                 import sys
                 sys.exit(1)
 
             # ── Backward ──────────────────────────────────────────────────
-            scaler.scale(scaled_loss).backward()
+            scaler.scale(loss).backward()
 
             # ── 옵티마이저 스텝 (grad_accum 마이크로-스텝마다) ─────────────
             is_update_step = (batch_idx + 1) % args.grad_accum == 0
@@ -543,16 +542,16 @@ def train(args: argparse.Namespace) -> None:
             step_samples.append(inputs.shape[0])
             throughput = sum(step_samples) / max(1e-9, sum(step_times))
 
-            # ── 배치 지표 (마지막 루프의 logits 기준) ─────────────────────
+            # ── 배치 지표 (cheap, no_grad) ────────────────────────────────
             with torch.no_grad():
-                m = compute_metrics(logits, carry.current_labels)
+                m = compute_metrics(logits_list, labels)
 
             epoch_loss  += loss_log["loss"]
             epoch_steps += 1
 
-            # ── tqdm postfix ──────────────────────────────────────────────
+            # ── tqdm postfix (매 스텝 갱신) ───────────────────────────────
             current_lr = optimizer.param_groups[0]["lr"]
-            avg_steps  = carry.steps.float().mean().item()
+            halt_means = [f"{p.mean().item():.2f}" for p in halt_probs_list]
 
             pbar.set_postfix(
                 loss     = f"{loss_log['loss']:.4f}",
@@ -561,46 +560,56 @@ def train(args: argparse.Namespace) -> None:
                 lr       = f"{current_lr:.2e}",
                 gnorm    = f"{last_grad_norm:.3f}",
                 samp_s   = f"{throughput:.0f}",
-                steps    = f"{avg_steps:.1f}",
+                halt     = "[" + ",".join(halt_means) + "]",
                 refresh  = False,
             )
 
-            # ── 상세 로그 ─────────────────────────────────────────────────
+            # ── 상세 로그 (log_interval 옵티마이저 스텝마다) ──────────────
             if is_update_step and global_step % args.log_interval == 0:
+                # ETA 계산
                 elapsed_total = time.time() - total_start
                 eta_sec       = (elapsed_total / max(1, global_step)) * max(0, total_steps - global_step)
                 h, rem        = divmod(int(eta_sec), 3600)
                 m_, s_        = divmod(rem, 60)
+
+                lpa_str = "  ".join(
+                    f"L{i+1}={v * 100:.1f}%"
+                    for i, v in enumerate(m["per_loop_puzzle_acc"])
+                )
 
                 mem_str = ""
                 if device.type == "cuda":
                     gb = torch.cuda.memory_allocated(device) / 1024 ** 3
                     mem_str = f"  mem={gb:.2f}GB"
 
-                dt_vals = [F.softplus(b.dt).item() for b in model.blocks]
-                dt_str = "[" + " ".join(f"{v:.3f}" for v in dt_vals) + "]"
-
                 tqdm.write(
                     f"[{global_step:6d}/{total_steps}]"
                     f"  loss={loss_log['loss']:.4f}"
                     f" (main={loss_log['main_loss']:.4f}"
-                    f" halt={loss_log['halt_loss']:.4f})"
+                    f" aux={loss_log['aux_loss']:.4f}"
+                    f" act={loss_log['act_loss']:.4f})"
                     f"  tok={m['token_acc'] * 100:.2f}%"
                     f"  puzz={m['puzzle_acc'] * 100:.2f}%"
-                    f"  avg_steps={avg_steps:.1f}"
+                    f"  [{lpa_str}]"
                     f"  lr={current_lr:.2e}"
                     f"  gnorm={last_grad_norm:.3f}"
-                    f"  dt={dt_str}"
                     f"  {throughput:.0f}samp/s"
                     f"  ETA {h:02d}:{m_:02d}:{s_:02d}"
                     f"{mem_str}"
                 )
 
-            # ── 평가 & 체크포인팅 ─────────────────────────────────────────
+            # ── 평가 & 체크포인팅 (eval_interval 옵티마이저 스텝마다) ──────
             if is_update_step and global_step > 0 and global_step % args.eval_interval == 0:
                 eval_res = evaluate(model, test_loader, device, args, autocast_ctx)
                 model.train()
-                carry = model.initial_carry(args.batch_size, seq_len, device)
+
+                # 루프별 puzzle_acc 정리
+                loop_str = "  ".join(
+                    f"L{k.replace('eval_loop', '').replace('_puzzle_acc', '')}="
+                    f"{v * 100:.2f}%"
+                    for k, v in eval_res.items()
+                    if k.startswith("eval_loop")
+                )
 
                 tqdm.write(
                     f"\n{'─' * 70}\n"
@@ -608,7 +617,7 @@ def train(args: argparse.Namespace) -> None:
                     f"  loss       = {eval_res['eval_loss']:.4f}\n"
                     f"  token_acc  = {eval_res['eval_token_acc']  * 100:.2f}%\n"
                     f"  puzzle_acc = {eval_res['eval_puzzle_acc'] * 100:.2f}%\n"
-                    f"  avg_steps  = {eval_res['eval_avg_steps']:.1f}\n"
+                    f"  per-loop   : {loop_str}\n"
                     f"{'─' * 70}\n"
                 )
 
