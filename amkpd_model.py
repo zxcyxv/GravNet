@@ -100,14 +100,10 @@ class AMK_Block(nn.Module):
         # ── 학습 가능한 스텝 파라미터 ──────────────────────────────────
         # self.dt  = nn.Parameter(torch.tensor(float(dt)))   # Δt: scalar (고정값 1.0으로 대체)
 
-        # ── 멀티헤드 선형 사영 ─────────────────────────────────────────
-        self.W_Q = nn.Linear(d_model, d_model, bias=False)
-        self.W_K = nn.Linear(d_model, d_model, bias=False)
-        self.W_V = nn.Linear(d_model, d_model, bias=False)
-        self.W_O = nn.Linear(d_model, d_model, bias=False)
-        nn.init.xavier_uniform_(self.W_O.weight)
-        self.W_aux = nn.Linear(d_model, d_model, bias=False)
-        nn.init.xavier_uniform_(self.W_aux.weight)
+        # ── 멀티헤드 선형 사영 (QKV fused) ────────────────────────────────
+        self.W_QKV = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.W_O_aux = nn.Linear(2 * d_model, d_model, bias=False)
+        nn.init.xavier_uniform_(self.W_O_aux.weight)
 
         # ── ConvSwiGLU ───────────────────────────────────────────────
         # 선형 팽창: d → 2*inner_dim  (G 와 U 로 분할)
@@ -160,12 +156,13 @@ class AMK_Block(nn.Module):
         H_context = Q_in + X                        # [B, N, d]
 
         # ══════════════════════════════════════════════════════
-        # Step 2: 멀티헤드 선형 사영 + 헤드 분할
+        # Step 2: 멀티헤드 선형 사영 + 헤드 분할 (fused QKV)
         # ══════════════════════════════════════════════════════
 
-        Q_proj = self.W_Q(H_context).view(B, N, H, d_h).transpose(1, 2)  # [B, H, N, d_h]
-        K_proj = self.W_K(H_context).view(B, N, H, d_h).transpose(1, 2)  # [B, H, N, d_h]
-        V_proj = self.W_V(H_context).view(B, N, H, d_h).transpose(1, 2)  # [B, H, N, d_h]
+        qkv = self.W_QKV(H_context).view(B, N, 3, H, d_h)
+        Q_proj = qkv[:, :, 0].transpose(1, 2)  # [B, H, N, d_h]
+        K_proj = qkv[:, :, 1].transpose(1, 2)  # [B, H, N, d_h]
+        V_proj = qkv[:, :, 2].transpose(1, 2)  # [B, H, N, d_h]
 
         # ══════════════════════════════════════════════════════
         # Step 3: 헤드별 비대칭 Bochner 매핑 (ELU+1 양수 보장)
@@ -180,7 +177,13 @@ class AMK_Block(nn.Module):
 
         scale = self.head_dim ** -0.5
         W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale  # [B, H, N, N]
-        W = F.relu(W) ** self.kernel_power                  # [B, H, N, N]
+        W = F.relu(W)
+        if self.kernel_power == 2:
+            W = W * W
+        elif self.kernel_power == 4:
+            W = W * W; W = W * W
+        elif self.kernel_power != 1:
+            W = W ** self.kernel_power
 
         # ══════════════════════════════════════════════════════
         # Step 5: 헤드별 Mean Shift
@@ -197,7 +200,7 @@ class AMK_Block(nn.Module):
 
         m_concat = m.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
         C_concat = C.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
-        m_proj = self.W_O(m_concat) + self.W_aux(C_concat)                # [B, N, d]
+        m_proj = self.W_O_aux(torch.cat([m_concat, C_concat], dim=-1))    # [B, N, d]
 
         self.last_m_norm = m_concat.detach().norm(dim=-1).mean().item()
         self.last_C_norm = C_concat.detach().norm(dim=-1).mean().item()

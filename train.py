@@ -94,9 +94,9 @@ def parse_args() -> argparse.Namespace:
 
     # ── 속도 ──────────────────────────────────────────────────────────────
     g = p.add_argument_group("Speed")
-    g.add_argument("--compile", action="store_true",
-                   help="torch.compile 활성화")
-    g.add_argument("--dtype",   choices=["float32", "bfloat16", "float16"], default="float32",
+    g.add_argument("--no_compile", action="store_true",
+                   help="torch.compile 비활성화")
+    g.add_argument("--dtype",   choices=["float32", "bfloat16", "float16"], default="bfloat16",
                    help="Mixed precision dtype")
 
     # ── 로깅 & 체크포인팅 ─────────────────────────────────────────────────
@@ -104,6 +104,8 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--checkpoint_dir", default="checkpoints")
     g.add_argument("--log_interval",   type=int, default=50,
                    help="상세 로그 출력 주기 (옵티마이저 스텝)")
+    g.add_argument("--eval_steps",     type=int, default=5000,
+                   help="스텝 단위 평가 주기 (iter 중간에도 eval)")
     g.add_argument("--save_top_k",     type=int, default=3,
                    help="상위 K개 체크포인트 보존")
     g.add_argument("--resume",         type=str, default=None,
@@ -244,6 +246,7 @@ def evaluate(
     device: torch.device,
     args: argparse.Namespace,
     autocast_ctx,
+    max_samples: int = 512,
 ) -> Dict[str, float]:
     model.eval()
 
@@ -253,10 +256,27 @@ def evaluate(
     puzzle_correct = 0.0
     puzzle_total = 0
     total_steps_sum = 0.0
+    n_batches = 0
 
-    for inputs, labels in tqdm(loader, desc="  [eval]", leave=False, dynamic_ncols=True):
-        inputs = inputs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+    # 큰 배치로 한 번에 처리 (test set이 작으므로)
+    all_inputs, all_labels = [], []
+    count = 0
+    for inputs, labels in loader:
+        all_inputs.append(inputs)
+        all_labels.append(labels)
+        count += inputs.shape[0]
+        if count >= max_samples:
+            break
+
+    all_inputs = torch.cat(all_inputs, dim=0)[:max_samples].to(device)
+    all_labels = torch.cat(all_labels, dim=0)[:max_samples].to(device)
+
+    # 배치 분할 (GPU 메모리에 맞게)
+    eval_bs = min(256, all_inputs.shape[0])
+    for start in range(0, all_inputs.shape[0], eval_bs):
+        end = min(start + eval_bs, all_inputs.shape[0])
+        inputs = all_inputs[start:end]
+        labels = all_labels[start:end]
         B = inputs.shape[0]
         seq_len = inputs.shape[1]
 
@@ -278,8 +298,9 @@ def evaluate(
         puzzle_correct += m["puzzle_acc"] * B
         puzzle_total += B
         total_steps_sum += carry.steps.float().sum().item()
+        n_batches += 1
 
-    n_batches = max(1, puzzle_total // B) if puzzle_total > 0 else 1
+    n_batches = max(1, n_batches)
     return {
         "eval_loss": total_loss / n_batches,
         "eval_token_acc": token_correct / max(1.0, token_total),
@@ -323,6 +344,7 @@ def train(args: argparse.Namespace) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
     print(f"Device : {device}")
 
     # ── URM epoch/iter 구조 ────────────────────────────────────────────────
@@ -380,9 +402,9 @@ def train(args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Params : {n_params:,}")
 
-    if args.compile:
+    if not args.no_compile:
         try:
-            model = torch.compile(model, mode="reduce-overhead")
+            model = torch.compile(model, dynamic=False)
             print("torch.compile : enabled")
         except Exception as e:
             print(f"torch.compile : skipped ({e})")
@@ -440,7 +462,7 @@ def train(args: argparse.Namespace) -> None:
     grad_log_path = Path(args.checkpoint_dir) / "grad_metrics.csv"
     grad_log_fields = [
         "step", "gnorm",
-        "b0_W_Q", "b0_W_K", "b0_W_V", "b0_W_O",
+        "b0_W_QKV", "b0_W_O_aux",
         "b0_W_up", "b0_W_down", "b0_dw_conv",
         "b0_norm1", "b0_norm2",
         "embedding", "pos_emb", "input_norm",
@@ -453,7 +475,7 @@ def train(args: argparse.Namespace) -> None:
 
     _known_prefixes = []
     for bi in range(args.num_layers):
-        for comp in ["W_Q", "W_K", "W_V", "W_O", "W_aux", "W_up", "W_down", "dw_conv", "norm1", "norm2"]:
+        for comp in ["W_QKV", "W_O_aux", "W_up", "W_down", "dw_conv", "norm1", "norm2"]:
             _known_prefixes.append(f"blocks.{bi}.{comp}")
     _known_prefixes += ["embedding", "pos_emb", "input_norm", "final_norm", "lm_head", "halt_head"]
 
@@ -473,10 +495,8 @@ def train(args: argparse.Namespace) -> None:
                     total += val ** 2
             return total ** 0.5
 
-        row["b0_W_Q"] = f"{sum_gnorm('blocks.0.W_Q'):.6f}"
-        row["b0_W_K"] = f"{sum_gnorm('blocks.0.W_K'):.6f}"
-        row["b0_W_V"] = f"{sum_gnorm('blocks.0.W_V'):.6f}"
-        row["b0_W_O"] = f"{sum_gnorm('blocks.0.W_O'):.6f}"
+        row["b0_W_QKV"] = f"{sum_gnorm('blocks.0.W_QKV'):.6f}"
+        row["b0_W_O_aux"] = f"{sum_gnorm('blocks.0.W_O_aux'):.6f}"
         row["b0_W_up"] = f"{sum_gnorm('blocks.0.W_up'):.6f}"
         row["b0_W_down"] = f"{sum_gnorm('blocks.0.W_down'):.6f}"
         row["b0_dw_conv"] = f"{sum_gnorm('blocks.0.dw_conv'):.6f}"
@@ -593,19 +613,20 @@ def train(args: argparse.Namespace) -> None:
             step_samples.append(inputs.shape[0])
             throughput = sum(step_samples) / max(1e-9, sum(step_times))
 
-            with torch.no_grad():
-                m = compute_metrics(logits, carry.current_labels)
-
             iter_loss += loss_log["loss"]
             iter_steps += 1
 
             current_lr = optimizer.param_groups[0]["lr"]
             avg_steps = carry.steps.float().mean().item()
 
+            # 매 배치 metrics 계산 생략 — 로그 주기에만 계산
+            should_log = is_update_step and global_step % args.log_interval == 0
+            if should_log:
+                with torch.no_grad():
+                    m = compute_metrics(logits, carry.current_labels)
+
             pbar.set_postfix(
                 loss=f"{loss_log['loss']:.4f}",
-                tok_acc=f"{m['token_acc']*100:.1f}%",
-                puzz_acc=f"{m['puzzle_acc']*100:.1f}%",
                 lr=f"{current_lr:.2e}",
                 gnorm=f"{last_grad_norm:.3f}",
                 samp_s=f"{throughput:.0f}",
@@ -614,7 +635,7 @@ def train(args: argparse.Namespace) -> None:
             )
 
             # ── 상세 로그 ────────────────────────────────────────────────
-            if is_update_step and global_step % args.log_interval == 0:
+            if should_log:
                 elapsed_total = time.time() - total_start
                 eta_sec = (elapsed_total / max(1, global_step)) * max(0, total_steps_approx - global_step)
                 h, rem = divmod(int(eta_sec), 3600)
@@ -641,7 +662,47 @@ def train(args: argparse.Namespace) -> None:
                     f"{mem_str}"
                 )
 
-        # ── Iter 끝: 평가 & 체크포인팅 ──────────────────────────────────────
+            # ── 스텝 단위 eval & 체크포인팅 ─────────────────────────────────
+            if is_update_step and global_step > 0 and global_step % args.eval_steps == 0:
+                eval_res = evaluate(model, test_loader, device, args, autocast_ctx)
+                model.train()
+
+                tqdm.write(
+                    f"\n{'─'*70}\n"
+                    f"[EVAL  step={global_step}]\n"
+                    f"  loss       = {eval_res['eval_loss']:.4f}\n"
+                    f"  token_acc  = {eval_res['eval_token_acc']*100:.2f}%\n"
+                    f"  puzzle_acc = {eval_res['eval_puzzle_acc']*100:.2f}%\n"
+                    f"  avg_steps  = {eval_res['eval_avg_steps']:.1f}\n"
+                    f"{'─'*70}"
+                )
+
+                puzzle_acc = eval_res["eval_puzzle_acc"]
+                is_best = puzzle_acc > best_puzzle_acc
+                if is_best:
+                    best_puzzle_acc = puzzle_acc
+
+                state = {
+                    "iter_id": iter_id,
+                    "global_step": global_step,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "best_puzzle_acc": best_puzzle_acc,
+                    "eval_results": eval_res,
+                    "args": vars(args),
+                }
+
+                fname = f"step{global_step:06d}_pacc{puzzle_acc:.4f}.pt"
+                ckpt_mgr.save(state, puzzle_acc, fname)
+                tqdm.write(f"  [ckpt] saved → {args.checkpoint_dir}/{fname}")
+
+                if is_best:
+                    best_path = Path(args.checkpoint_dir) / "best.pt"
+                    torch.save(state, best_path)
+                    tqdm.write(f"  [ckpt] ★ NEW BEST  puzzle_acc={puzzle_acc:.4f}")
+
+        # ── Iter 끝: 요약 ────────────────────────────────────────────────────
         avg_loss = iter_loss / max(1, iter_steps)
         current_epoch = (iter_id + 1) * epochs_per_iter
         tqdm.write(
@@ -650,44 +711,6 @@ def train(args: argparse.Namespace) -> None:
             f"  avg_loss={avg_loss:.4f}  step={global_step}\n"
             f"{'═'*70}"
         )
-
-        # Eval
-        eval_res = evaluate(model, test_loader, device, args, autocast_ctx)
-        model.train()
-
-        tqdm.write(
-            f"[EVAL  step={global_step}  epoch={current_epoch}]\n"
-            f"  loss       = {eval_res['eval_loss']:.4f}\n"
-            f"  token_acc  = {eval_res['eval_token_acc']*100:.2f}%\n"
-            f"  puzzle_acc = {eval_res['eval_puzzle_acc']*100:.2f}%\n"
-            f"  avg_steps  = {eval_res['eval_avg_steps']:.1f}\n"
-        )
-
-        puzzle_acc = eval_res["eval_puzzle_acc"]
-        is_best = puzzle_acc > best_puzzle_acc
-        if is_best:
-            best_puzzle_acc = puzzle_acc
-
-        state = {
-            "iter_id": iter_id,
-            "epoch": current_epoch,
-            "global_step": global_step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "best_puzzle_acc": best_puzzle_acc,
-            "eval_results": eval_res,
-            "args": vars(args),
-        }
-
-        fname = f"step{global_step:06d}_ep{current_epoch}_pacc{puzzle_acc:.4f}.pt"
-        ckpt_mgr.save(state, puzzle_acc, fname)
-        tqdm.write(f"  [ckpt] saved → {args.checkpoint_dir}/{fname}")
-
-        if is_best:
-            best_path = Path(args.checkpoint_dir) / "best.pt"
-            torch.save(state, best_path)
-            tqdm.write(f"  [ckpt] ★ NEW BEST  puzzle_acc={puzzle_acc:.4f}")
 
     tqdm.write(f"\n훈련 완료.  Best puzzle_acc = {best_puzzle_acc:.4f}")
 
