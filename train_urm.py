@@ -9,6 +9,7 @@ train.py (AMK-PD)와 동일한 인터페이스, 동일한 로그 포맷.
 """
 
 import argparse
+import csv
 import json
 import math
 import time
@@ -388,6 +389,79 @@ def train(args: argparse.Namespace) -> None:
         print(f"Resumed : {args.resume}  epoch={start_epoch}  step={global_step}")
 
     ckpt_mgr    = CheckpointManager(args.checkpoint_dir, args.save_top_k)
+
+    # ── Gradient metric 로깅 설정 ──────────────────────────────────────────
+    grad_log_path = Path(args.checkpoint_dir) / "grad_metrics.csv"
+    grad_log_fields = [
+        "step", "gnorm",
+        # layer 0
+        "l0_qkv_proj", "l0_o_proj",
+        "l0_gate_up_proj", "l0_down_proj", "l0_dwconv",
+        # layer 1
+        "l1_qkv_proj", "l1_o_proj",
+        "l1_gate_up_proj", "l1_down_proj", "l1_dwconv",
+        # global components
+        "embed_tokens", "lm_head", "q_head",
+        # 누락 체크
+        "other",
+    ]
+    with open(grad_log_path, "w", newline="") as f:
+        csv.writer(f).writerow(grad_log_fields)
+
+    # 각 필드가 커버하는 prefix 목록 (other 계산용)
+    _known_prefixes = [
+        "layers.0.self_attn.qkv_proj", "layers.0.self_attn.o_proj",
+        "layers.0.mlp.gate_up_proj", "layers.0.mlp.down_proj", "layers.0.mlp.dwconv",
+        "layers.1.self_attn.qkv_proj", "layers.1.self_attn.o_proj",
+        "layers.1.mlp.gate_up_proj", "layers.1.mlp.down_proj", "layers.1.mlp.dwconv",
+        "embed_tokens", "lm_head", "q_head",
+    ]
+
+    def collect_grad_norms(model, step, gnorm):
+        """컴포넌트별 gradient norm 수집 → CSV 1행"""
+        row = {"step": step, "gnorm": f"{gnorm:.6f}"}
+
+        param_gnorms = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                param_gnorms[name] = p.grad.norm().item()
+            else:
+                param_gnorms[name] = 0.0
+
+        def sum_gnorm(*prefixes):
+            total = 0.0
+            for name, val in param_gnorms.items():
+                if any(name.startswith(px) for px in prefixes):
+                    total += val ** 2
+            return total ** 0.5
+
+        # layer 0
+        row["l0_qkv_proj"]     = f"{sum_gnorm('layers.0.self_attn.qkv_proj'):.6f}"
+        row["l0_o_proj"]       = f"{sum_gnorm('layers.0.self_attn.o_proj'):.6f}"
+        row["l0_gate_up_proj"] = f"{sum_gnorm('layers.0.mlp.gate_up_proj'):.6f}"
+        row["l0_down_proj"]    = f"{sum_gnorm('layers.0.mlp.down_proj'):.6f}"
+        row["l0_dwconv"]       = f"{sum_gnorm('layers.0.mlp.dwconv'):.6f}"
+        # layer 1
+        row["l1_qkv_proj"]     = f"{sum_gnorm('layers.1.self_attn.qkv_proj'):.6f}"
+        row["l1_o_proj"]       = f"{sum_gnorm('layers.1.self_attn.o_proj'):.6f}"
+        row["l1_gate_up_proj"] = f"{sum_gnorm('layers.1.mlp.gate_up_proj'):.6f}"
+        row["l1_down_proj"]    = f"{sum_gnorm('layers.1.mlp.down_proj'):.6f}"
+        row["l1_dwconv"]       = f"{sum_gnorm('layers.1.mlp.dwconv'):.6f}"
+        # global
+        row["embed_tokens"]    = f"{sum_gnorm('embed_tokens'):.6f}"
+        row["lm_head"]         = f"{sum_gnorm('lm_head'):.6f}"
+        row["q_head"]          = f"{sum_gnorm('q_head'):.6f}"
+        # 누락 파라미터 체크
+        other_sq = 0.0
+        for name, val in param_gnorms.items():
+            if not any(name.startswith(px) for px in _known_prefixes):
+                other_sq += val ** 2
+        row["other"] = f"{other_sq ** 0.5:.6f}"
+
+        with open(grad_log_path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=grad_log_fields)
+            w.writerow(row)
+
     total_start = time.time()
 
     step_times:   deque = deque(maxlen=100)
@@ -452,6 +526,9 @@ def train(args: argparse.Namespace) -> None:
                 last_grad_norm = nn.utils.clip_grad_norm_(
                     model.parameters(), args.max_grad_norm
                 ).item()
+                # gradient metric 기록 (clip 후, zero_grad 전) — log_interval 주기에만
+                if global_step % args.log_interval == 0:
+                    collect_grad_norms(model, global_step, last_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()

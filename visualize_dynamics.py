@@ -1,7 +1,14 @@
+"""
+prompt.txt 기반 4가지 핵심 시각화:
+1. Head-wise Topological Specialization Map (헤드별 위상 제약 특화도)
+2. Hypersphere Angular Trajectory (초구면 각거리 궤적)
+3. Kernel Sparsity via Gini/Tsallis (다항식 커널 희소성)
+4. Head Orthogonality (헤드 간 이동벡터 직교성)
+"""
+
 import os
 import argparse
 import json
-import time
 import math
 import torch
 import torch.nn as nn
@@ -9,29 +16,50 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
-from sklearn.decomposition import PCA
-from sklearn.metrics import silhouette_score
 import torch.nn.functional as F
-
-try:
-    import umap
-    HAS_UMAP = True
-except ImportError:
-    HAS_UMAP = False
 
 from dataset import create_dataloaders
 from amkpd_model import AMKPDModel, AMK_Block, AMKPDCarry
-from train import build_optimizer_and_scheduler, compute_loss
 
-def calculate_effective_rank(Q):
-    ranks = []
-    for b in range(Q.shape[0]):
-        # Singular Value Decomposition on (N, d)
-        U, S, V = torch.linalg.svd(Q[b].float(), full_matrices=False)
-        p = S / (S.sum() + 1e-9)
-        entropy = -torch.sum(p * torch.log(p + 1e-9))
-        ranks.append(torch.exp(entropy).item())
-    return np.mean(ranks)
+
+# ── Sudoku topology helpers ──────────────────────────────────────────────
+
+def get_row_indices(idx):
+    """idx (0-80)와 같은 행(row)에 있는 셀 인덱스들 (자기 자신 제외)"""
+    row = idx // 9
+    return [row * 9 + c for c in range(9) if row * 9 + c != idx]
+
+def get_col_indices(idx):
+    """idx와 같은 열(col)에 있는 셀 인덱스들 (자기 자신 제외)"""
+    col = idx % 9
+    return [r * 9 + col for r in range(9) if r * 9 + col != idx]
+
+def get_box_indices(idx):
+    """idx와 같은 3x3 박스에 있는 셀 인덱스들 (자기 자신 제외)"""
+    row, col = idx // 9, idx % 9
+    box_r, box_c = (row // 3) * 3, (col // 3) * 3
+    return [
+        (box_r + dr) * 9 + (box_c + dc)
+        for dr in range(3) for dc in range(3)
+        if (box_r + dr) * 9 + (box_c + dc) != idx
+    ]
+
+
+def gini(array):
+    """Gini coefficient: 0=perfect equality, 1=perfect inequality"""
+    array = np.abs(array.flatten())
+    array = np.sort(array) + 1e-12
+    n = len(array)
+    index = np.arange(1, n + 1)
+    return float((np.sum((2 * index - n - 1) * array)) / (n * np.sum(array)))
+
+
+def tsallis_entropy(p, q=2.0):
+    """Tsallis entropy: lower = more sparse (q=2 is default)"""
+    p = np.abs(p) + 1e-12
+    p = p / p.sum()
+    return float((1.0 - np.sum(p ** q)) / (q - 1.0))
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -39,650 +67,652 @@ def main():
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--train_steps", type=int, default=1000)
-    parser.add_argument("--checkpoint", type=str, default=None, help="저장된 모델 가중치 (예: checkpoints/best.pt)")
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--n_loops_viz", type=int, default=20,
+                        help="Number of outer loops for visualization")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # 1. DataLoader
-    train_loader, test_loader, meta = create_dataloaders(args.data_dir, args.batch_size, 0, device.type == "cuda")
-    
-    # 2. Checkpoint Pre-loading for Model Architecture Specs
+    # ── 1. Data ──
+    train_loader, test_loader, meta = create_dataloaders(
+        args.data_dir, args.batch_size, 0, device.type == "cuda"
+    )
+
+    # ── 2. Checkpoint loading ──
     ckpt_args = {}
-    if args.checkpoint is not None and os.path.exists(args.checkpoint):
-        print(f"Loading checkpoint from {args.checkpoint}...")
-        ckpt = torch.load(args.checkpoint, map_location=device)
+    if args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"Loading checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         ckpt_args = ckpt.get("args", {})
-        if ckpt_args:
-            print(f"Loaded config from checkpoint: d_model={ckpt_args.get('d_model')}, num_heads={ckpt_args.get('num_heads')}")
-            args.d_model = ckpt_args.get("d_model", args.d_model)
-            args.num_heads = ckpt_args.get("num_heads", args.num_heads)
+        args.d_model = ckpt_args.get("d_model", args.d_model)
+        args.num_heads = ckpt_args.get("num_heads", args.num_heads)
 
     model = AMKPDModel(
         vocab_size=meta["vocab_size"],
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_layers=ckpt_args.get("num_layers", 3),
-        loops=ckpt_args.get("loops", 6),
+        loops=args.n_loops_viz,
         H_cycles=ckpt_args.get("H_cycles", 2),
         L_cycles=ckpt_args.get("L_cycles", 1),
         kernel_power=ckpt_args.get("kernel_power", 2),
+        expansion_ratio=ckpt_args.get("expansion_ratio", 4),
+        conv_kernel_size=ckpt_args.get("conv_kernel", 3),
     ).to(device)
 
-    # Fake train args
-    class TrainArgs:
-        weight_decay = 0.1
-        lr = 3e-4
-        warmup_steps = 100
-        halt_loss_coef = 0.01
-        grad_accum = 1
-        max_grad_norm = 1.0
-        loops = ckpt_args.get("loops", 6)
-
-    t_args = TrainArgs()
-    optimizer, scheduler = build_optimizer_and_scheduler(model, t_args, args.train_steps)
-    
-    # 3. Checkpoint Restoring or Pre-training
-    if args.checkpoint is not None and os.path.exists(args.checkpoint):
+    if args.checkpoint and os.path.exists(args.checkpoint):
         model.load_state_dict(ckpt["model"])
-        print("Checkpoint weights loaded successfully. Skipping pre-training.")
-    else:
-        if args.checkpoint is not None:
-            print(f"Warning: Checkpoint {args.checkpoint} not found. Proceeding with pre-training.")
-            
-        model.train()
-        step = 0
-        seq_len = meta["seq_len"]
-        carry = model.initial_carry(args.batch_size, seq_len, device)
-        pbar = tqdm(total=args.train_steps, desc="Pre-Training for Viz")
-        while step < args.train_steps:
-            for inputs, labels in train_loader:
-                if step >= args.train_steps: break
-                inputs, labels = inputs.to(device), labels.to(device)
-                if inputs.shape[0] != carry.current_hidden.shape[0]:
-                    carry = model.initial_carry(inputs.shape[0], seq_len, device)
-                batch = (inputs, labels)
-                optimizer.zero_grad()
-                # 1 batch = 1 forward (URM 패턴, carry가 배치 간 상태 전달)
-                carry, logits, q_logits = model(carry, batch)
-                loss, _ = compute_loss(logits, q_logits, carry.current_labels, t_args)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                step += 1
-                pbar.update(1)
-        pbar.close()
+        print("Checkpoint loaded.")
 
-    # 4. Extracting Features (Native Telemetry via multi-forward carry loop)
     model.eval()
-    print("Extracting features (1 batch, up to 64 samples) ...")
-    inputs, labels = next(iter(test_loader))
-    inputs = inputs[:min(64, inputs.shape[0])].to(device)
-    labels = labels[:inputs.shape[0]].to(device)
-    B_viz = inputs.shape[0]
-    seq_len = inputs.shape[1]
 
-    # 텔레메트리 켜기
+    # ── 3. Feature extraction via telemetry ──
+    print("Extracting features ...")
+    inputs, labels = next(iter(test_loader))
+    B_viz = min(16, inputs.shape[0])
+    inputs = inputs[:B_viz].to(device)
+    labels = labels[:B_viz].to(device)
+    seq_len = inputs.shape[1]
+    H = args.num_heads
+
+    # Enable telemetry
     model.log_viz = True
     for b in model.blocks:
         b.log_viz = True
 
-    # carry 기반 다중 forward로 텔레메트리 수집
     carry = model.initial_carry(B_viz, seq_len, device)
     batch = (inputs, labels)
 
-    # 외부 루프별 텔레메트리 수집
-    global_Q = []
-    global_H = []
-    global_W = []
-    global_m = []
+    # Per-loop collection: W_per_head[loop][block] = [B, H, N, N]
+    # m_per_head[loop][block] = [B, H, N, d_h]
+    global_Q = [carry.current_hidden.detach().cpu()]
+    W_per_head = []  # list of list of tensors
+    m_per_head = []
     K_blocks = len(model.blocks)
-    M_loops = model.loops
 
     with torch.no_grad():
-        # 초기 상태 수집
-        global_Q.append(carry.current_hidden.detach().cpu())
-
-        for outer in range(M_loops):
-            # 각 forward 호출 전 블록 텔레메트리 리셋
+        for outer in range(args.n_loops_viz):
             for b in model.blocks:
                 b.viz_W = []
                 b.viz_m = []
                 b.viz_H = []
             model.viz_Q = []
-            model.viz_H_global = []
 
-            carry, logits, halt_logits = model(carry, batch)
+            carry, logits, _ = model(carry, batch)
 
-            # forward 내부에서 수집된 텔레메트리 추출
-            # viz_Q: L_cycles + 1개 (gradient H_cycle의 각 L_cycle 경계)
             for q in model.viz_Q:
                 if isinstance(q, torch.Tensor):
-                    global_Q.append(q.detach().cpu())
-            for h in model.viz_H_global:
-                if isinstance(h, torch.Tensor):
-                    global_H.append(h.detach().cpu())
+                    global_Q.append(q.cpu())
 
-            # 블록별 W, m 수집 (gradient H_cycle에서만)
+            # Collect per-block W and m for this loop
             n_micro = len(model.blocks[0].viz_W)
             for mi in range(n_micro):
-                loop_m_tensors = []
-                for k_idx in range(K_blocks):
-                    global_W.append(model.blocks[k_idx].viz_W[mi].detach().cpu())
-                    loop_m_tensors.append(model.blocks[k_idx].viz_m[mi].detach().cpu())
-                global_m.append(loop_m_tensors)
+                loop_W = []
+                loop_m = []
+                for k in range(K_blocks):
+                    loop_W.append(model.blocks[k].viz_W[mi].cpu())  # [B, H, N, N]
+                    loop_m.append(model.blocks[k].viz_m[mi].cpu())  # [B, H, N, d_h]
+                W_per_head.append(loop_W)
+                m_per_head.append(loop_m)
 
-    # 동역학적인 Jacobian Norm (Hutchinson Estimator)
-    print("Calculating Dynamical Jacobian Norms via Hutchinson Estimator...")
-    global_J_norm = []
-
-    X_input = model.embedding(inputs[0:1]) + model.pos_emb(torch.arange(seq_len, device=inputs.device).unsqueeze(0))
-    X_input = model.input_norm(X_input)
-
-    n_jacobian_steps = len(global_Q) - 1
-    for l in range(n_jacobian_steps):
-        Q_l = global_Q[l][0:1].to(device).detach().clone().requires_grad_(True)
-        # 첫 번째 블록 야코비안 계산 (X는 블록 내부에서 주입)
-        model.blocks[0].viz_m = []
-        with torch.enable_grad():
-            _ = model.blocks[0](Q_l, X_input)
-            m_vec = model.blocks[0].viz_m[-1]
-
-            norm_sq_sum = 0
-            for _ in range(5):
-                v = torch.randn_like(m_vec)
-                vjp = torch.autograd.grad(m_vec, Q_l, v, retain_graph=True)[0]
-                norm_sq_sum += (vjp ** 2).sum().item()
-            global_J_norm.append(math.sqrt(norm_sq_sum / 5.0))
-
-    # ── B. Maximal Lyapunov Exponent (MLE) 근사 측정 ──
-    print("Calculating Maximal Lyapunov Exponent (MLE) ...")
-
-    epsilon = 1e-5
-    perturbation = torch.randn_like(X_input)
-    perturbation = perturbation / torch.norm(perturbation, dim=-1, keepdim=True) * epsilon
-    X_perturbed = X_input + perturbation
-
-    Q_orig = X_input.clone()
-    Q_pert = X_perturbed.clone()
-
-    lyapunov_exponents = []
-    log_sum = 0.0
-
-    with torch.no_grad():
-        for l in range(n_jacobian_steps):
-            # L_cycle: 블록 통과 (X는 블록 내부에서 주입)
-            for block in model.blocks:
-                Q_orig = block(Q_orig, X_input)
-                Q_pert = block(Q_pert, X_input)
-
-            delta_Q = torch.norm(Q_pert - Q_orig, dim=-1).mean().item()
-
-            log_sum += math.log(delta_Q / epsilon)
-            mle = log_sum / (l + 1)
-            lyapunov_exponents.append(mle)
-
-            Q_pert = Q_orig + (Q_pert - Q_orig) / (delta_Q + 1e-12) * epsilon
-
-    # 텔레메트리 끄기
+    # Disable telemetry
     model.log_viz = False
     for b in model.blocks:
         b.log_viz = False
 
-    # M_loops 재정의: 실제 수집된 외부 루프 수 (Jacobian/MLE 스텝)
-    M_loops = n_jacobian_steps
-
     os.makedirs("visualizations", exist_ok=True)
-    metrics_log = {}
-    
-    # ── 1. Shannon Entropy & Heatmap ───────────────────────────────────────────
-    print("Plotting 1. Attraction Map Shannon Entropy ...")
-    entropies = []
-    for W_tensor in global_W:
-        P = torch.abs(W_tensor)
-        P = P / (P.sum(dim=-1, keepdim=True) + 1e-9)
-        H = -torch.sum(P * torch.log(P + 1e-9), dim=-1).mean().item()
-        entropies.append(H)
-    
-    plt.figure(figsize=(10, 4))
-    plt.plot(range(1, len(entropies)+1), entropies, marker='o', color='purple')
-    plt.title("Shannon Entropy of Normalized Attraction Map over Micro-Layers")
-    plt.xlabel("Micro-Layer (l)")
-    plt.ylabel("Mean Entropy H(W)")
-    plt.axhline(y=np.log(81), color='r', linestyle='--', label="Log(N)=4.39 (Uniform Flatness)")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("visualizations/01_Entropy_Line.png")
-    plt.close()
-    
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(global_W[-1][0].numpy(), cmap='coolwarm', center=0)
-    plt.title(f"Attraction Map Heatmap W (Sample 1, Last Micro-Layer)\nEntropy: {entropies[-1]:.3f}")
-    plt.savefig("visualizations/01_Entropy_Heatmap.png")
-    plt.close()
+    metrics = {}
 
-    # Calculate and store heatmap metrics
-    metrics_log["heatmap_entropies"] = entropies
-    last_W = global_W[-1][0].numpy()
-    max_probs = np.max(np.abs(last_W) / (np.abs(last_W).sum(axis=-1, keepdims=True) + 1e-9), axis=-1)
-    metrics_log["heatmap_mean_max_prob"] = float(np.mean(max_probs))
-    
-    def gini(array):
-        array = array.flatten()
-        if np.amin(array) < 0: array -= np.amin(array)
-        array += 1e-9
-        array = np.sort(array)
-        index = np.arange(1, array.shape[0]+1)
-        n = array.shape[0]
-        return float((np.sum((2 * index - n  - 1) * array)) / (n * np.sum(array)))
-    
-    metrics_log["heatmap_gini_coefficient"] = gini(last_W)
-
-    # ── 2. Topological Trajectory (UMAP/PCA) ──────────────────────────────────
-    print("Plotting 2. Topological Trajectory ...")
-    loops = len(global_Q)
-    Q_cat = torch.stack(global_Q, dim=0) # [Loops, B, N, d]
-    
-    B, N_seq, d = inputs.shape[0], inputs.shape[1], args.d_model
-    Q_traj = Q_cat[:, 0, :, :].numpy() # [Loops, 81, d]
-    
+    # Use sample 0 for all per-sample analyses
     inp_0 = inputs[0].cpu().numpy()
-    given_mask = (inp_0 > 1)  # 1 is blank, 2-10 are 1-9
-    
-    Q_flat = Q_traj.reshape(loops * N_seq, d)
+    lbl_0 = labels[0].cpu().numpy()
+    given_mask = (inp_0 > 1)  # 1=blank, 2-10 = digits 1-9
+    blank_indices = np.where(~given_mask)[0]
+
+    N_seq = seq_len  # 81
+    n_loops_collected = len(W_per_head)
+    d_h = args.d_model // H
+
+    print(f"Collected {n_loops_collected} micro-steps, {len(global_Q)} Q snapshots")
+    print(f"Blanks: {len(blank_indices)}, Given: {given_mask.sum()}")
+
+    # ════════════════════════════════════════════════════════════════════
+    # 1. Head-wise Topological Specialization Map
+    # ════════════════════════════════════════════════════════════════════
+    print("\n[1/4] Head-wise Topological Specialization Map ...")
+
+    # Pick a blank cell near the center
+    query_idx = blank_indices[len(blank_indices) // 2] if len(blank_indices) > 0 else 40
+
+    row_neighbors = set(get_row_indices(query_idx))
+    col_neighbors = set(get_col_indices(query_idx))
+    box_neighbors = set(get_box_indices(query_idx))
+
+    # Use the last micro-step, last block
+    W_last = W_per_head[-1][-1][0].numpy()  # [H, N, N], sample 0
+
+    fig, axes = plt.subplots(2, (H + 1) // 2, figsize=(4 * ((H + 1) // 2), 8))
+    axes = axes.flatten()
+
+    head_topology_mass = {"row": [], "col": [], "box": []}
+
+    for h in range(H):
+        ax = axes[h]
+        att_row = W_last[h, query_idx]  # [81]
+        grid_9x9 = att_row.reshape(9, 9)
+        sns.heatmap(grid_9x9, ax=ax, cmap='YlOrRd', cbar=True, cbar_kws={'shrink': 0.6},
+                    square=True, linewidths=0.5, linecolor='gray')
+        ax.set_title(f"Head {h}", fontsize=11)
+
+        # In-Topology Mass Ratio
+        total_mass = att_row.sum() + 1e-12
+        row_mass = att_row[list(row_neighbors)].sum() / total_mass
+        col_mass = att_row[list(col_neighbors)].sum() / total_mass
+        box_mass = att_row[list(box_neighbors)].sum() / total_mass
+        head_topology_mass["row"].append(float(row_mass))
+        head_topology_mass["col"].append(float(col_mass))
+        head_topology_mass["box"].append(float(box_mass))
+
+        ax.set_xlabel(f"R:{row_mass:.2f} C:{col_mass:.2f} B:{box_mass:.2f}", fontsize=8)
+
+    for i in range(H, len(axes)):
+        axes[i].axis('off')
+
+    query_r, query_c = query_idx // 9, query_idx % 9
+    fig.suptitle(
+        f"Head-wise Attraction for Blank Cell ({query_r},{query_c}) [idx={query_idx}]\n"
+        f"R=Row mass, C=Col mass, B=Box mass",
+        fontsize=13
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    plt.savefig("visualizations/01_head_topology_specialization.png", dpi=200)
+    plt.close()
+
+    # Bar chart: per-head topology mass
+    fig, ax = plt.subplots(figsize=(10, 5))
+    x = np.arange(H)
+    width = 0.25
+    ax.bar(x - width, head_topology_mass["row"], width, label='Row', color='#e74c3c')
+    ax.bar(x, head_topology_mass["col"], width, label='Column', color='#3498db')
+    ax.bar(x + width, head_topology_mass["box"], width, label='Box', color='#2ecc71')
+    ax.set_xlabel("Head")
+    ax.set_ylabel("In-Topology Mass Ratio")
+    ax.set_title("Head Topological Specialization (Row / Col / Box)")
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"H{i}" for i in range(H)])
+    ax.legend()
+    ax.grid(axis='y', alpha=0.3)
+    # Uniform baseline: each constraint has 8 neighbors out of 80 other cells
+    ax.axhline(y=8.0 / 80.0, color='gray', linestyle='--', alpha=0.5, label='Uniform (8/80)')
+    plt.tight_layout()
+    plt.savefig("visualizations/01_head_topology_bar.png", dpi=200)
+    plt.close()
+
+    metrics["head_topology_mass"] = head_topology_mass
+
+    # ════════════════════════════════════════════════════════════════════
+    # 2. Hypersphere Angular Trajectory
+    # ════════════════════════════════════════════════════════════════════
+    print("[2/4] Hypersphere Angular Trajectory ...")
+
+    n_q = len(global_Q)
+    cos_sims_given = []
+    cos_sims_blank = []
+    angular_velocities = []
+
+    for l in range(1, n_q):
+        Q_prev = global_Q[l - 1][0].numpy()  # [81, d], sample 0
+        Q_curr = global_Q[l][0].numpy()
+
+        # Per-token cosine similarity
+        dot = np.sum(Q_prev * Q_curr, axis=-1)
+        norm_prev = np.linalg.norm(Q_prev, axis=-1) + 1e-12
+        norm_curr = np.linalg.norm(Q_curr, axis=-1) + 1e-12
+        cos_sim = dot / (norm_prev * norm_curr)
+        cos_sim = np.clip(cos_sim, -1.0, 1.0)
+
+        cos_sims_given.append(float(cos_sim[given_mask].mean()))
+        cos_sims_blank.append(float(cos_sim[~given_mask].mean()))
+
+        # Angular velocity = arccos(cos_sim)
+        angles = np.arccos(cos_sim)
+        angular_velocities.append(float(angles.mean()))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    steps = range(1, n_q)
+    ax1.plot(steps, cos_sims_given, 'b-o', markersize=3, label='Given cells', alpha=0.8)
+    ax1.plot(steps, cos_sims_blank, 'r-o', markersize=3, label='Blank cells', alpha=0.8)
+    ax1.set_xlabel("Step (Q snapshot)")
+    ax1.set_ylabel("Cosine Similarity")
+    ax1.set_title("Cosine Similarity S_C(Q^l, Q^{l-1})")
+    ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.4)
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(steps, angular_velocities, 'g-s', markersize=3, linewidth=2)
+    ax2.set_xlabel("Step (Q snapshot)")
+    ax2.set_ylabel("Angular Velocity (radians)")
+    ax2.set_title("Angular Velocity on Hypersphere")
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.4)
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle("Projected Dynamics: Hypersphere Angular Trajectory", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/02_angular_trajectory.png", dpi=200)
+    plt.close()
+
+    metrics["cosine_sim_given"] = cos_sims_given
+    metrics["cosine_sim_blank"] = cos_sims_blank
+    metrics["angular_velocity"] = angular_velocities
+
+    # ════════════════════════════════════════════════════════════════════
+    # 3. Kernel Sparsity via Gini / Tsallis Entropy
+    # ════════════════════════════════════════════════════════════════════
+    print("[3/4] Kernel Sparsity (Gini / Tsallis) ...")
+
+    # Per head, per micro-step: Gini and Tsallis of W[h] for all query tokens
+    gini_per_step = {h: [] for h in range(H)}  # gini_per_step[head][step]
+    tsallis_per_step = {h: [] for h in range(H)}
+
+    for step_idx in range(n_loops_collected):
+        # Use last block
+        W_step = W_per_head[step_idx][-1][0].numpy()  # [H, N, N], sample 0
+        for h in range(H):
+            W_h = W_step[h]  # [N, N]
+            # Average Gini across all query tokens
+            ginis = [gini(W_h[q]) for q in range(N_seq)]
+            tsallises = [tsallis_entropy(W_h[q]) for q in range(N_seq)]
+            gini_per_step[h].append(float(np.mean(ginis)))
+            tsallis_per_step[h].append(float(np.mean(tsallises)))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    cmap = plt.get_cmap('tab10')
+
+    for h in range(H):
+        color = cmap(h)
+        ax1.plot(range(1, n_loops_collected + 1), gini_per_step[h],
+                 marker='o', markersize=2, color=color, label=f'Head {h}', alpha=0.8)
+        ax2.plot(range(1, n_loops_collected + 1), tsallis_per_step[h],
+                 marker='o', markersize=2, color=color, label=f'Head {h}', alpha=0.8)
+
+    ax1.set_xlabel("Micro-step")
+    ax1.set_ylabel("Gini Coefficient")
+    ax1.set_title("Gini Coefficient (higher = sparser)")
+    ax1.legend(fontsize=7, ncol=2)
+    ax1.grid(True, alpha=0.3)
+
+    ax2.set_xlabel("Micro-step")
+    ax2.set_ylabel("Tsallis Entropy (q=2)")
+    ax2.set_title("Tsallis Entropy (lower = sparser)")
+    ax2.legend(fontsize=7, ncol=2)
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle("Polynomial Kernel Sparsity Across Loops", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/03_kernel_sparsity.png", dpi=200)
+    plt.close()
+
+    metrics["gini_per_head"] = {str(h): gini_per_step[h] for h in range(H)}
+    metrics["tsallis_per_head"] = {str(h): tsallis_per_step[h] for h in range(H)}
+
+    # ════════════════════════════════════════════════════════════════════
+    # 4. Head Orthogonality (m_h 간 코사인 거리)
+    # ════════════════════════════════════════════════════════════════════
+    print("[4/4] Head Orthogonality of Net Force Vectors ...")
+
+    # Per micro-step: compute H x H cosine similarity of m_h
+    # m_h shape per step/block: [B, H, N, d_h]
+    # Flatten m_h to [H, B*N*d_h] then compute pairwise cosine
+
+    ortho_matrices = []  # list of [H, H] arrays
+    mean_off_diag = []   # mean abs off-diagonal cosine sim
+
+    checkpoints_to_plot = []
+    # Sample a few steps for heatmap plots
+    plot_indices = [0, n_loops_collected // 4, n_loops_collected // 2,
+                    3 * n_loops_collected // 4, n_loops_collected - 1]
+    plot_indices = sorted(set([max(0, min(i, n_loops_collected - 1)) for i in plot_indices]))
+
+    for step_idx in range(n_loops_collected):
+        # Use last block, sample 0
+        m_step = m_per_head[step_idx][-1][0].numpy()  # [H, N, d_h]
+
+        # Flatten each head: [H, N*d_h]
+        m_flat = m_step.reshape(H, -1)
+        # Normalize
+        norms = np.linalg.norm(m_flat, axis=1, keepdims=True) + 1e-12
+        m_normed = m_flat / norms
+
+        # Cosine similarity matrix [H, H]
+        cos_mat = m_normed @ m_normed.T
+        ortho_matrices.append(cos_mat)
+
+        # Mean absolute off-diagonal
+        mask = ~np.eye(H, dtype=bool)
+        mean_off_diag.append(float(np.abs(cos_mat[mask]).mean()))
+
+        if step_idx in plot_indices:
+            checkpoints_to_plot.append((step_idx, cos_mat.copy()))
+
+    # Plot: H x H heatmaps at selected steps
+    n_plots = len(checkpoints_to_plot)
+    fig, axes = plt.subplots(1, n_plots, figsize=(4 * n_plots, 4))
+    if n_plots == 1:
+        axes = [axes]
+
+    for i, (step_idx, cos_mat) in enumerate(checkpoints_to_plot):
+        ax = axes[i]
+        sns.heatmap(cos_mat, ax=ax, vmin=-1, vmax=1, cmap='RdBu_r', center=0,
+                    annot=True, fmt='.2f', square=True, cbar=(i == n_plots - 1),
+                    xticklabels=[f"H{h}" for h in range(H)],
+                    yticklabels=[f"H{h}" for h in range(H)])
+        ax.set_title(f"Step {step_idx + 1}", fontsize=10)
+
+    plt.suptitle("Head-wise m Vector Cosine Similarity (0 = Orthogonal)", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.92])
+    plt.savefig("visualizations/04_head_orthogonality_heatmaps.png", dpi=200)
+    plt.close()
+
+    # Plot: mean off-diagonal over steps
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(range(1, n_loops_collected + 1), mean_off_diag, 'b-o', markersize=3)
+    ax.set_xlabel("Micro-step")
+    ax.set_ylabel("Mean |cos(m_h, m_j)| (off-diagonal)")
+    ax.set_title("Head Force Vector Orthogonality Over Loops\n(Lower = more independent heads)")
+    ax.axhline(y=0, color='green', linestyle='--', alpha=0.5, label='Perfect orthogonality')
+    ax.axhline(y=1, color='red', linestyle='--', alpha=0.5, label='Mode collapse')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("visualizations/04_head_orthogonality_trend.png", dpi=200)
+    plt.close()
+
+    metrics["head_orthogonality_mean_offdiag"] = mean_off_diag
+
+    # ════════════════════════════════════════════════════════════════════
+    # 5. Class-Conditioned Latent Projection (Neural Collapse 시각화)
+    # ════════════════════════════════════════════════════════════════════
+    print("[5/7] Class-Conditioned Neural Collapse Trajectory ...")
+
+    from sklearn.decomposition import PCA
+    try:
+        import umap
+        HAS_UMAP = True
+    except ImportError:
+        HAS_UMAP = False
+
+    n_q = len(global_Q)
+    # 선택할 루프 체크포인트 (최대 8개)
+    q_checkpoints = [0, 1, 2, 4, 8, 12, 16, n_q - 1]
+    q_checkpoints = sorted(set([min(c, n_q - 1) for c in q_checkpoints]))
+
+    # 모든 체크포인트의 Q를 한번에 차원축소
+    Q_all = np.concatenate([global_Q[c][0].numpy() for c in q_checkpoints], axis=0)  # [n_ckpt*81, d]
     if HAS_UMAP:
         reducer = umap.UMAP(n_components=2, random_state=42)
-        print(" Using UMAP...")
     else:
         reducer = PCA(n_components=2)
-        print(" Using PCA...")
-        
-    Q_proj_flat = reducer.fit_transform(Q_flat)
-    Q_proj = Q_proj_flat.reshape((loops, N_seq, 2))
-    
-    plt.figure(figsize=(10, 10))
-    cmap = plt.get_cmap('viridis')
-    colors = [cmap(i / max(1, loops - 1)) for i in range(loops)]
-    
-    # Plot Trajectories
-    for n in range(N_seq):
-        traj_x = Q_proj[:, n, 0]
-        traj_y = Q_proj[:, n, 1]
-        
-        is_given = given_mask[n]
-        color_start = 'mediumblue' if is_given else 'tomato'
-        marker = 's' if is_given else 'o'
-        
-        # 완전 겹치는 0번 토큰들을 분리해 눈으로 확인하기 위한 위치 흩뿌림(Jitter) 추가
-        jx, jy = (np.random.normal(0, 0.4), np.random.normal(0, 0.4)) if not is_given else (0, 0)
-        
-        plt.plot(traj_x + jx, traj_y + jy, color='gray', alpha=0.3, linewidth=1, zorder=1)
-        # Start
-        plt.scatter(traj_x[0] + jx, traj_y[0] + jy, c=color_start, marker=marker, s=50, alpha=0.8, zorder=2)
-        # End
-        plt.scatter(traj_x[-1] + jx, traj_y[-1] + jy, c='black' if is_given else 'green', marker=marker, s=80, edgecolors='w', zorder=3)
-        
-    # Legend hacking
-    plt.scatter([], [], c='mediumblue', marker='s', label='Given (Start)')
-    plt.scatter([], [], c='black', marker='s', label='Given (End)')
-    plt.scatter([], [], c='tomato', marker='o', label='Empty (Start)')
-    plt.scatter([], [], c='green', marker='o', label='Empty (End)')
-    
-    plt.title("Topological Trajectory Tracking Across Macro-Loops")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig("visualizations/02_Trajectory.png")
-    plt.close()
+    Q_2d_all = reducer.fit_transform(Q_all)  # [n_ckpt*81, 2]
+    Q_2d_split = Q_2d_all.reshape(len(q_checkpoints), N_seq, 2)
 
-    # Calculate and store trajectory metrics
-    dist_moved_given = np.linalg.norm(Q_traj[-1, given_mask] - Q_traj[0, given_mask], axis=-1).mean().item()
-    dist_moved_blank = np.linalg.norm(Q_traj[-1, ~given_mask] - Q_traj[0, ~given_mask], axis=-1).mean().item()
-    metrics_log["trajectory_dist_moved_given"] = float(dist_moved_given)
-    metrics_log["trajectory_dist_moved_blank"] = float(dist_moved_blank)
+    cmap_9 = plt.get_cmap('tab10')
+    n_cols = min(4, len(q_checkpoints))
+    n_rows = (len(q_checkpoints) + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
+    axes = np.array(axes).flatten()
 
-    if len(np.unique(given_mask)) > 1:
-        sil_score = silhouette_score(Q_traj[-1], given_mask)
-    else:
-        sil_score = 0.0
-    metrics_log["trajectory_silhouette_score"] = float(sil_score)
+    for ci, ckpt_idx in enumerate(q_checkpoints):
+        ax = axes[ci]
+        ax.set_title(f"Q snapshot {ckpt_idx}", fontsize=11)
+        px = Q_2d_split[ci, :, 0]
+        py = Q_2d_split[ci, :, 1]
 
-    # ── 3. Effective Dimensionality (Rank Collapse) ───────────────────────────
-    print("Plotting 3. Effective Dimensionality ...")
-    eff_ranks = []
-    for l in range(loops):
-        Q_l = global_Q[l] # [B, N, d]
-        er = calculate_effective_rank(Q_l)
-        eff_ranks.append(er)
-        
-    plt.figure(figsize=(10, 4))
-    plt.plot(range(loops), eff_ranks, marker='s', color='green', linewidth=2)
-    plt.title("Effective Dimensionality (Rank Collapse Detection)")
-    plt.xlabel("Macro-Loop (0=Input Layer)")
-    plt.ylabel("Effective Rank")
-    plt.axhline(y=args.d_model, color='r', linestyle=':', label=f"Max Possible ({args.d_model})")
-    plt.axhline(y=args.d_model / 4, color='orange', linestyle='--', label=f"Safe Threshold (d/4 = {args.d_model/4})")
-    plt.legend()
-    plt.grid(True)
-    plt.ylim(0, args.d_model * 1.1)
-    plt.savefig("visualizations/03_Effective_Rank.png")
-    plt.close()
-
-    metrics_log["effective_ranks"] = [float(er) for er in eff_ranks]
-    # ── 3.5. Step-by-Step Dynamics & Internal Parameters (추가된 코드) ──
-    print("Calculating Step-by-Step Dynamics & Internal Parameters ...")
-    
-    # 1) 각 거시적 루프(Macro-Loop) 간의 이동 거리 (Delta Q)
-    step_moved_given = []
-    step_moved_blank = []
-    for l in range(1, loops):
-        # Q_cat shape: [Loops, B, N, d]
-        delta_Q = np.linalg.norm(Q_cat[l, 0].numpy() - Q_cat[l-1, 0].numpy(), axis=-1) # [81]
-        step_moved_given.append(float(delta_Q[given_mask].mean()))
-        step_moved_blank.append(float(delta_Q[~given_mask].mean()))
-        
-    metrics_log["dynamics_step_movement_given"] = step_moved_given
-    metrics_log["dynamics_step_movement_blank"] = step_moved_blank
-
-    # 2) 모델이 스스로 학습한 블록별 스텝 사이즈 (dt_safe)
-    learned_dts = []
-    for k_idx, block in enumerate(model.blocks):
-        dt_val = F.softplus(block.dt).item()
-        learned_dts.append(float(dt_val))
-    metrics_log["dynamics_learned_dt_per_block"] = learned_dts
-
-    # 3) 각 루프/블록별 중력 벡터(m)의 실제 크기 (Net Force Magnitude)
-    # m 벡터가 정말로 0에 수렴해서 입자가 멈춘 것인지 확인
-    m_vector_norms = []
-    for m_idx in range(M_loops):
-        loop_m_norms = []
-        for k_idx in range(K_blocks):
-            # 오염되지 않은 global_m 리스트에서 직접 조회
-            m_tensor = global_m[m_idx][k_idx] # [B, N, d]
-            m_norm = torch.norm(m_tensor[0], dim=-1).mean().item()
-            loop_m_norms.append(float(m_norm))
-        m_vector_norms.append(loop_m_norms) # [M_loops, K_blocks]
-        
-    metrics_log["dynamics_mean_shift_net_force"] = m_vector_norms
-    # ── 4. Advanced Manifold Evaluation Metrics ───────────────────────────────
-    print("Calculating 4. Advanced Manifold Metrics ...")
-    
-    # Extract labels for the first sample
-    lbl = labels[0].cpu().numpy()  # [81]
-    
-    mad_gaps = []
-    target_silhouettes = []
-    explained_vars_top1 = []
-    explained_vars_top9 = []
-    explained_vars_top27 = []
-    
-    # global_H가 있으면 H_context 공간 사용 (= 실제 KDE 작용 공간), 없으면 Q로 폴백
-    use_H = len(global_H) > 0
-    n_manifold_loops = len(global_H) if use_H else loops
-
-    for l in range(n_manifold_loops):
-        feat_l = global_H[l][0].numpy() if use_H else global_Q[l][0].numpy()  # [81, d]
-        
-        # A) Target-Conditioned Silhouette Score
-        mask = lbl != 0
-        if len(np.unique(lbl[mask])) > 1:
-            try:
-                sil = silhouette_score(feat_l[mask], lbl[mask])
-            except Exception:
-                sil = 0.0
-        else:
-            sil = 0.0
-        target_silhouettes.append(float(sil))
-        
-        # B) Class-Conditioned MAD & MAD-Gap
-        Q_v = feat_l[mask]
-        l_v = lbl[mask]
-        if len(Q_v) > 1:
-            Q_norm_v = Q_v / (np.linalg.norm(Q_v, axis=1, keepdims=True) + 1e-9)
-            dist_mat = 1.0 - (Q_norm_v @ Q_norm_v.T)
-            
-            target_mask = (l_v[:, None] == l_v[None, :])
-            np.fill_diagonal(target_mask, False)
-            remote_mask = (l_v[:, None] != l_v[None, :])
-            
-            mad_tgt = dist_mat[target_mask].mean() if target_mask.any() else 0.0
-            mad_rem = dist_mat[remote_mask].mean() if remote_mask.any() else 0.0
-            mad_gap = mad_rem - mad_tgt
-        else:
-            mad_gap = 0.0
-            
-        mad_gaps.append(float(mad_gap))
-
-        # ── A. Neural Collapse Indices (NC1, NC2) ──
-        if len(np.unique(l_v)) > 1:
-            classes = np.unique(l_v)
-            num_classes = len(classes)
-            global_mean = np.mean(Q_v, axis=0)
-
-            class_means = []
-            within_class_scatter = 0.0
-            for c in classes:
-                Q_c = Q_v[l_v == c]
-                mu_c = np.mean(Q_c, axis=0)
-                class_means.append(mu_c)
-                within_class_scatter += np.sum(np.linalg.norm(Q_c - mu_c, axis=1)**2)
-
-            within_class_scatter /= len(Q_v)
-
-            class_means = np.array(class_means)
-            between_class_scatter = np.sum(np.linalg.norm(class_means - global_mean, axis=1)**2) / num_classes
-
-            nc1 = within_class_scatter / (between_class_scatter + 1e-9)
-
-            M_mat = (class_means - global_mean).T  # [d, num_classes]
-            M_norm_sq = np.linalg.norm(M_mat, 'fro')**2 + 1e-9
-            cos_mat = (M_mat.T @ M_mat) / M_norm_sq
-
-            ideal_etf = (num_classes / (num_classes - 1)) * np.eye(num_classes) - (1 / (num_classes - 1)) * np.ones((num_classes, num_classes))
-            nc2 = np.linalg.norm(cos_mat - ideal_etf, 'fro')
-        else:
-            nc1, nc2 = 0.0, 0.0
-
-        metrics_log.setdefault("manifold_nc1_collapse", []).append(float(nc1))
-        metrics_log.setdefault("manifold_nc2_etf", []).append(float(nc2))
-
-        # C) Singular Spectrum Explained Variance
-        U, S, V = np.linalg.svd(feat_l, full_matrices=False)
-        S_sq = S**2
-        tot_var = S_sq.sum() + 1e-9
-        explained_vars_top1.append(float(S_sq[:1].sum() / tot_var))
-        explained_vars_top9.append(float(S_sq[:9].sum() / tot_var))
-        explained_vars_top27.append(float((S_sq[:27].sum() if len(S_sq)>=27 else S_sq.sum()) / tot_var))
-
-    metrics_log["manifold_target_silhouette_scores"] = target_silhouettes
-    metrics_log["manifold_mad_gaps"] = mad_gaps
-    metrics_log["manifold_explained_variance_top1"] = explained_vars_top1
-    metrics_log["manifold_explained_variance_top9"] = explained_vars_top9
-    metrics_log["manifold_explained_variance_top27"] = explained_vars_top27
-    metrics_log["dynamics_jacobian_norms"] = global_J_norm
-    metrics_log["dynamics_maximal_lyapunov_exponent"] = lyapunov_exponents
-    
-    # ── 5. Anchor-Target Ratio (ATR) & Bipartite Trajectory ─────────────────
-    print("Calculating and Plotting 5. Target-Conditioned Bipartite Trajectory & ATR ...")
-    
-    ATR_history = []
-    cohered_blanks_history = []
-    
-    # ATR/응집 계산 대상: H_context 공간 (= 실제 중력 작용 공간)
-    # 이분 구조 투영(2D):은 Q 공간 (= 눈에 보이는 입자 움직임) 사용
-    H_arr = global_H if use_H else global_Q
-    h_loops = len(H_arr)
-    H_flat = np.stack([H_arr[l][0].numpy() for l in range(h_loops)], axis=0).reshape(h_loops * N_seq, -1)
-    if HAS_UMAP:
-        reducer_bipartite = umap.UMAP(n_components=2, random_state=42)
-    else:
-        reducer_bipartite = PCA(n_components=2)
-        
-    H_proj_flat_bip = reducer_bipartite.fit_transform(H_flat)
-    H_proj_bip = H_proj_flat_bip.reshape((h_loops, N_seq, 2))
-    
-    # Q는 이분구조 시각화(Bipartite plot)에서만 사용
-    Q_proj_flat_bip = reducer_bipartite.fit_transform(Q_flat) if loops > 0 else H_proj_flat_bip
-    Q_proj_bip = Q_proj_flat_bip.reshape((loops, N_seq, 2))
-    
-    # 클래스 1~9를 위한 색상 팔레트 (tab10의 1~9 인덱스 사용)
-    palette = plt.get_cmap('tab10')
-    
-    for l in range(h_loops):
-        H_l = H_arr[l][0].numpy() # [81, d] — 실제 중력 작용 공간
-        
-        # 1. 클래스별 힌트 셀(Given Cells)의 질량 중심(Centroid) 계산 (H_context 기준)
-        centroids = {}
         for c in range(1, 10):
-            c_given_mask = given_mask & (lbl == c)
-            if c_given_mask.any():
-                centroids[c] = H_l[c_given_mask].mean(axis=0)
-                
-        # 2D 시각화 공간(H_proj 기준)의 질량 중심
-        centroids_2d = {}
-        for c in range(1, 10):
-            c_given_mask = given_mask & (lbl == c)
-            if c_given_mask.any():
-                centroids_2d[c] = H_proj_bip[l][c_given_mask].mean(axis=0)
-                
-        # 2D 시각화 공간 상에서의 앵커(힌트 셀) 군집 간 평균 거리
-        if len(centroids_2d) > 1:
-            cent_coords_2d = np.array(list(centroids_2d.values()))
-            from scipy.spatial.distance import pdist
-            inter_cent_dist_2d = np.mean(pdist(cent_coords_2d))
-            # 육안으로 보이는 응집(Cohesion) 기준: 앵커 간 평균 거리의 15% 이내 진입
-            cohesion_threshold_2d = inter_cent_dist_2d * 0.15 
-        else:
-            cohesion_threshold_2d = 1e-9
-        
-        # 2. 빈칸 셀의 고차원 ATR 계산 및 2D 시각적 응집 포인트 개수 카운팅
-        d_targets = []
-        d_remotes = []
-        cohered_blanks = 0
-        
-        for idx in range(N_seq):
-            if not given_mask[idx]: # 빈칸 셀인 경우
-                true_c = lbl[idx]
-                if true_c in centroids:
-                    # 1) H_context 고차원 거리 (ATR 지표)
-                    d_target = np.linalg.norm(H_l[idx] - centroids[true_c])
-                    d_targets.append(d_target)
-                    
-                    # 2) H_proj 2D 화면 거리 (응집 카운팅)
-                    d_target_2d = np.linalg.norm(H_proj_bip[l, idx] - centroids_2d[true_c])
-                    if d_target_2d < cohesion_threshold_2d:
-                        cohered_blanks += 1
-                        
-                    # 오답 앵커들과의 평균 거리 (H_context 기준)
-                    remote_dists = [np.linalg.norm(H_l[idx] - centroids[k]) for k in centroids if k != true_c]
-                    if remote_dists:
-                        d_remotes.append(np.mean(remote_dists))
-        
-        if d_targets and d_remotes:
-            mean_d_target = np.mean(d_targets)
-            mean_d_remote = np.mean(d_remotes)
-            # ATR: Target 거리 / Remote 거리. 1.0 미만으로 수렴해야 정상 작동을 의미함.
-            ATR = mean_d_target / (mean_d_remote + 1e-9)
-            ATR_history.append(float(ATR))
-        else:
-            ATR_history.append(0.0)
-            
-        cohered_blanks_history.append(int(cohered_blanks))
-
-    # 3. 이분 궤적(Bipartite Trajectory) 시각화 플로팅 (레이어별 차례대로 배치)
-    cols = math.ceil(loops / 2)
-    fig, axes = plt.subplots(2, cols, figsize=(5 * cols, 10))
-    axes = axes.flatten()
-    
-    for l in range(loops):
-        ax = axes[l]
-        ax.set_title(f"Macro-Loop {l}", fontsize=12)
-        
-        for idx in range(N_seq):
-            true_c = lbl[idx]
-            color_c = palette(true_c)
-            px = Q_proj_bip[l, idx, 0]
-            py = Q_proj_bip[l, idx, 1]
-            
-            if given_mask[idx]:
-                # 힌트 셀 (경계 조건 앵커): 별 모양 마커
-                ax.scatter(px, py, c=[color_c], marker='*', s=200, edgecolors='black', linewidth=1.0, zorder=5)
-            else:
-                # 빈칸 셀 (자유 입자): 원형 마커
-                jx, jy = np.random.normal(0, 0.1), np.random.normal(0, 0.1)
-                ax.scatter(px + jx, py + jy, c=[color_c], marker='o', s=50, edgecolors='white', linewidth=0.5, alpha=0.7, zorder=4)
-                
+            mask_c = (lbl_0 == c + 1)  # labels use 2-10 for digits 1-9
+            if not mask_c.any():
+                continue
+            color = cmap_9(c)
+            # Blank cells: circle
+            blank_c = mask_c & ~given_mask
+            if blank_c.any():
+                ax.scatter(px[blank_c], py[blank_c], c=[color], marker='o',
+                           s=50, alpha=0.7, zorder=3)
+            # Given cells: star
+            given_c = mask_c & given_mask
+            if given_c.any():
+                ax.scatter(px[given_c], py[given_c], c=[color], marker='*',
+                           s=180, edgecolors='black', linewidth=0.5, zorder=5)
         ax.grid(True, alpha=0.3)
-        
-    # 남는 subplot 숨기기
-    for l in range(loops, len(axes)):
-        axes[l].axis('off')
 
-    plt.suptitle("Target-Conditioned Bipartite Separation across Macro-Loops", fontsize=16, y=0.95)
-    
-    # Custom Legend
+    for i in range(len(q_checkpoints), len(axes)):
+        axes[i].axis('off')
+
+    # Legend
     from matplotlib.lines import Line2D
-    custom_lines = [
-        Line2D([0], [0], marker='*', color='w', markerfacecolor='gray', markersize=15, markeredgecolor='black'),
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=10, markeredgecolor='white')
-    ]
-    fig.legend(handles=custom_lines, labels=['Given Cells (Anchors)', 'Blank Cells (Moving Particles)'], loc='lower center', ncol=2, fontsize=12)
-    
-    plt.tight_layout(rect=[0, 0.05, 1, 0.93])
-    plt.savefig("visualizations/04_Bipartite_Trajectory.png", dpi=300)
+    legend_elements = []
+    for c in range(1, 10):
+        legend_elements.append(Line2D([0], [0], marker='o', color='w',
+                                       markerfacecolor=cmap_9(c), markersize=8,
+                                       label=str(c)))
+    legend_elements.append(Line2D([0], [0], marker='*', color='w',
+                                   markerfacecolor='gray', markersize=12,
+                                   markeredgecolor='black', label='Given'))
+    fig.legend(handles=legend_elements, loc='lower center', ncol=10, fontsize=9)
+
+    plt.suptitle("Class-Conditioned Latent Space (Colors = Ground Truth Digits 1-9)", fontsize=14)
+    plt.tight_layout(rect=[0, 0.05, 1, 0.94])
+    plt.savefig("visualizations/05_class_conditioned_collapse.png", dpi=200)
     plt.close()
 
-    metrics_log["manifold_anchor_target_ratio"] = ATR_history
-    metrics_log["manifold_cohered_blank_cells"] = cohered_blanks_history
-    # ── 6. Multimodal Attraction Distribution (다봉 분포 검증) ─────────────────
-    print("Calculating and Plotting 6. Multimodal Attraction Profile ...")
-    
-    last_W = global_W[-1][0].numpy()  # 마지막 루프/마지막 레이어의 Attraction Map [81, 81]
-    
-    # 아무 빈칸(Blank Cell) 하나를 쿼리로 선택
-    blank_indices = np.where(~given_mask)[0]
-    if len(blank_indices) > 0:
-        query_idx = blank_indices[0]
-        att_vector = last_W[query_idx]  # [81]
-        
-        plt.figure(figsize=(14, 4))
-        plt.bar(range(N_seq), att_vector, color='lightgray', label='Blank Cells (Ignored)')
-        
-        # 정답 힌트가 있는 앵커(Given Cells)들을 붉은색으로 하이라이트
-        given_indices = np.where(given_mask)[0]
-        if len(given_indices) > 0:
-            plt.bar(given_indices, att_vector[given_indices], color='tomato', label='Given Cells (Anchors)')
-        
-        # 다봉 분포 피크 측정을 위한 균등 분포(Uniform) 기준선
-        uniform_baseline = 1.0 / N_seq
-        plt.axhline(y=uniform_baseline, color='blue', linestyle='--', alpha=0.5, label='Uniform Baseline')
-        
-        plt.title(f"Attraction Distribution for Blank Cell {query_idx} (Checking for Multi-peaked Mass)")
-        plt.xlabel("Key Token Index (0~80)")
-        plt.ylabel("Attraction Probability Mass")
-        plt.legend()
-        plt.grid(axis='y', alpha=0.3)
-        plt.tight_layout()
-        plt.savefig("visualizations/05_Multimodal_Attraction.png", dpi=300)
-        plt.close()
-        
-        # 다봉 분포 수치 검증 지표 저장
-        mass_on_given = att_vector[given_indices].sum()
-        metrics_log["attraction_mass_on_given_cells"] = float(mass_on_given)
-        
-        # 균등 분포 대비 1.5배 이상의 확률 질량을 가진 "유의미한 피크(Peak)" 개수 카운팅
-        peak_threshold = uniform_baseline * 1.5
-        significant_peaks = np.sum(att_vector > peak_threshold)
-        peaks_on_given = np.sum(att_vector[given_indices] > peak_threshold)
-        
-        metrics_log["attraction_significant_peaks_total"] = int(significant_peaks)
-        metrics_log["attraction_significant_peaks_on_given"] = int(peaks_on_given)
+    # ════════════════════════════════════════════════════════════════════
+    # 6. Label-Sorted Attraction Matrix + Block Diagonal Ratio (BDR)
+    # ════════════════════════════════════════════════════════════════════
+    print("[6/7] Label-Sorted Attraction Matrix + BDR ...")
 
+    # ── BDR 계산 함수 ──
+    # BDR = (같은 숫자 블록 내부 W 합) / (전체 W 합)
+    # Uniform baseline: 9 블록 × 9×9 / 81² = 1/9 ≈ 0.111
+    def compute_bdr(W_matrix, labels):
+        """Block Diagonal Ratio: 같은 레이블 블록 내부 질량 비율"""
+        total = W_matrix.sum() + 1e-12
+        in_block = 0.0
+        for c in np.unique(labels):
+            mask_c = (labels == c)
+            in_block += W_matrix[np.ix_(mask_c, mask_c)].sum()
+        return float(in_block / total)
+
+    # Column Periodicity Ratio (CPR): 같은 열(위치 차이가 9의 배수) 내부 질량 비율
+    # Uniform baseline: 각 셀에 같은 열 셀 8개 + 자기 자신 = 9/81 = 1/9 ≈ 0.111
+    def compute_cpr(W_matrix):
+        """Column Periodicity Ratio: 같은 열 셀 간 질량 비율"""
+        N = W_matrix.shape[0]
+        total = W_matrix.sum() + 1e-12
+        col_mask = np.zeros((N, N), dtype=bool)
+        for i in range(N):
+            col_i = i % 9
+            for j in range(N):
+                if j % 9 == col_i:
+                    col_mask[i, j] = True
+        return float(W_matrix[col_mask].sum() / total)
+
+    # Row Periodicity Ratio (RPR): 같은 행 셀 간 질량 비율
+    def compute_rpr(W_matrix):
+        """Row Periodicity Ratio: 같은 행 셀 간 질량 비율"""
+        N = W_matrix.shape[0]
+        total = W_matrix.sum() + 1e-12
+        row_mask = np.zeros((N, N), dtype=bool)
+        for i in range(N):
+            row_i = i // 9
+            for j in range(N):
+                if j // 9 == row_i:
+                    row_mask[i, j] = True
+        return float(W_matrix[row_mask].sum() / total)
+
+    # ── 루프별 BDR/CPR/RPR 추적 ──
+    bdr_history = []
+    cpr_history = []
+    rpr_history = []
+
+    for step_idx in range(n_loops_collected):
+        W_step = W_per_head[step_idx][-1][0].numpy()  # [H, N, N]
+        W_avg = W_step.mean(axis=0)  # [N, N]
+        bdr_history.append(compute_bdr(W_avg, lbl_0))
+        cpr_history.append(compute_cpr(W_avg))
+        rpr_history.append(compute_rpr(W_avg))
+
+    # ── BDR/CPR/RPR 추이 플롯 ──
+    fig, ax = plt.subplots(figsize=(12, 5))
+    steps = range(1, n_loops_collected + 1)
+    ax.plot(steps, bdr_history, 'r-o', markersize=3, linewidth=2, label='BDR (Same Digit)')
+    ax.plot(steps, cpr_history, 'b-s', markersize=3, linewidth=2, label='CPR (Same Column)')
+    ax.plot(steps, rpr_history, 'g-^', markersize=3, linewidth=2, label='RPR (Same Row)')
+    ax.axhline(y=1/9, color='gray', linestyle='--', alpha=0.6, label=f'Uniform baseline (1/9={1/9:.3f})')
+    ax.set_xlabel("Micro-step")
+    ax.set_ylabel("Mass Ratio")
+    ax.set_title("Block Diagonal Ratio (BDR) vs Column/Row Periodicity\n"
+                 "BDR>1/9 = digit identity learned, CPR>1/9 = column structure, RPR>1/9 = row structure")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, max(max(cpr_history), max(bdr_history), max(rpr_history)) * 1.15)
+    plt.tight_layout()
+    plt.savefig("visualizations/06_bdr_trend.png", dpi=200)
+    plt.close()
+
+    metrics["block_diagonal_ratio"] = bdr_history
+    metrics["column_periodicity_ratio"] = cpr_history
+    metrics["row_periodicity_ratio"] = rpr_history
+
+    # ── 루프별 Label-Sorted 히트맵 (선택된 체크포인트) ──
+    ls_checkpoints = [0, n_loops_collected // 4, n_loops_collected // 2, n_loops_collected - 1]
+    ls_checkpoints = sorted(set([max(0, min(c, n_loops_collected - 1)) for c in ls_checkpoints]))
+
+    sorted_indices = np.argsort(lbl_0)
+    sorted_labels = lbl_0[sorted_indices]
+    boundaries = np.where(sorted_labels[:-1] != sorted_labels[1:])[0] + 1
+
+    n_ls = len(ls_checkpoints)
+    fig, axes = plt.subplots(1, n_ls, figsize=(6 * n_ls, 5.5))
+    if n_ls == 1:
+        axes = [axes]
+
+    for ci, step_idx in enumerate(ls_checkpoints):
+        W_step = W_per_head[step_idx][-1][0].numpy().mean(axis=0)  # [N, N]
+        sorted_W = W_step[sorted_indices][:, sorted_indices]
+        bdr_val = bdr_history[step_idx]
+
+        ax = axes[ci]
+        sns.heatmap(sorted_W, ax=ax, cmap='viridis', cbar=(ci == n_ls - 1), square=True)
+        for b in boundaries:
+            ax.axhline(b, color='white', linewidth=0.7, alpha=0.5)
+            ax.axvline(b, color='white', linewidth=0.7, alpha=0.5)
+        ax.set_title(f"Step {step_idx+1}\nBDR={bdr_val:.4f}", fontsize=10)
+
+        # 블록 레이블
+        prev = 0
+        for b in list(boundaries) + [len(sorted_labels)]:
+            mid = (prev + b) / 2
+            digit = sorted_labels[prev] - 1 if sorted_labels[prev] >= 2 else sorted_labels[prev]
+            ax.text(mid, -1.5, str(digit), ha='center', fontsize=7, color='red')
+            prev = b
+
+    plt.suptitle("Label-Sorted Attraction Matrix Across Loops\n"
+                 "(9×9 bright blocks on diagonal = digit identity learned)", fontsize=12)
+    plt.tight_layout(rect=[0, 0, 1, 0.90])
+    plt.savefig("visualizations/06_label_sorted_attraction.png", dpi=200)
+    plt.close()
+
+    # ════════════════════════════════════════════════════════════════════
+    # 7. Spatial 2D Receptive Field (헤드별 9x9 그리드 인력)
+    # ════════════════════════════════════════════════════════════════════
+    print("[7/7] Head-wise Spatial 2D Receptive Field ...")
+
+    # 빈칸 중 하나 선택
+    target_q_idx = blank_indices[len(blank_indices) // 2]
+    target_q_r, target_q_c = target_q_idx // 9, target_q_idx % 9
+    target_q_digit = lbl_0[target_q_idx] - 1 if lbl_0[target_q_idx] >= 2 else '?'
+
+    # 루프 체크포인트 여러 개에서 헤드 평균 W의 변화
+    rf_checkpoints = [0, n_loops_collected // 4, n_loops_collected // 2, n_loops_collected - 1]
+    rf_checkpoints = sorted(set([max(0, min(c, n_loops_collected - 1)) for c in rf_checkpoints]))
+
+    fig, axes = plt.subplots(len(rf_checkpoints), H + 1, figsize=(3 * (H + 1), 3.5 * len(rf_checkpoints)))
+    if len(rf_checkpoints) == 1:
+        axes = axes[np.newaxis, :]
+
+    for ri, step_idx in enumerate(rf_checkpoints):
+        W_step = W_per_head[step_idx][-1][0].numpy()  # [H, N, N]
+
+        # 헤드 평균 (첫 열)
+        W_avg = W_step.mean(axis=0)  # [N, N]
+        att_avg = W_avg[target_q_idx].reshape(9, 9)
+        ax = axes[ri, 0]
+        sns.heatmap(att_avg, ax=ax, cmap='magma', cbar=False, square=True,
+                    linewidths=0.5, linecolor='gray')
+        # 3x3 경계
+        for b in [3, 6]:
+            ax.axhline(b, color='cyan', linewidth=1.5)
+            ax.axvline(b, color='cyan', linewidth=1.5)
+        # 쿼리 셀 표시
+        ax.add_patch(plt.Rectangle((target_q_c, target_q_r), 1, 1,
+                     fill=False, edgecolor='lime', linewidth=2.5))
+        ax.set_title(f"Step {step_idx+1}\nAvg" if ri == 0 else f"Step {step_idx+1}\nAvg", fontsize=9)
+        if ri == 0:
+            ax.set_title(f"Avg\nStep {step_idx+1}", fontsize=9)
+
+        # 각 헤드
+        for h in range(H):
+            att_h = W_step[h, target_q_idx].reshape(9, 9)
+            ax = axes[ri, h + 1]
+            sns.heatmap(att_h, ax=ax, cmap='magma', cbar=False, square=True,
+                        linewidths=0.3, linecolor='gray')
+            for b in [3, 6]:
+                ax.axhline(b, color='cyan', linewidth=1)
+                ax.axvline(b, color='cyan', linewidth=1)
+            ax.add_patch(plt.Rectangle((target_q_c, target_q_r), 1, 1,
+                         fill=False, edgecolor='lime', linewidth=2))
+            if ri == 0:
+                ax.set_title(f"H{h}\nStep {step_idx+1}", fontsize=9)
+            else:
+                ax.set_title(f"Step {step_idx+1}", fontsize=9)
+
+            # 힌트 셀 표시 (헤드별 첫 행에서만)
+            if ri == len(rf_checkpoints) - 1:
+                for idx in range(81):
+                    ir, ic = idx // 9, idx % 9
+                    if given_mask[idx]:
+                        digit = lbl_0[idx] - 1 if lbl_0[idx] >= 2 else '?'
+                        ax.text(ic + 0.5, ir + 0.5, str(digit),
+                                ha='center', va='center', color='white',
+                                fontsize=6, fontweight='bold', alpha=0.7)
+
+    fig.suptitle(
+        f"Spatial 2D Receptive Field — Query=({target_q_r},{target_q_c}), "
+        f"Answer={target_q_digit}\n"
+        f"Rows=Loop steps, Cols=Avg+Heads. Green box=Query cell, Cyan=Box boundaries",
+        fontsize=12
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/07_spatial_receptive_field.png", dpi=200)
+    plt.close()
+
+    # ── Save metrics ──
     with open("visualizations/metrics.json", "w") as f:
-        json.dump(metrics_log, f, indent=4)
+        json.dump(metrics, f, indent=2)
 
-    print("Visualizations and advanced metrics complete! Results saved to 'visualizations' folder.")
+    print("\nDone! Results saved to visualizations/")
+    print(f"  01_head_topology_specialization.png  - Head-wise attraction heatmaps")
+    print(f"  01_head_topology_bar.png             - In-Topology Mass Ratio bar chart")
+    print(f"  02_angular_trajectory.png            - Cosine sim + angular velocity")
+    print(f"  03_kernel_sparsity.png               - Gini & Tsallis per head")
+    print(f"  04_head_orthogonality_heatmaps.png   - H x H cosine sim matrices")
+    print(f"  04_head_orthogonality_trend.png      - Off-diagonal trend")
+    print(f"  05_class_conditioned_collapse.png    - Neural Collapse trajectory")
+    print(f"  06_label_sorted_attraction.png       - Block-diagonal check")
+    print(f"  07_spatial_receptive_field.png        - 9x9 receptive field per head")
+
+
 if __name__ == "__main__":
     main()

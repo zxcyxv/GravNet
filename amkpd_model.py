@@ -98,7 +98,7 @@ class AMK_Block(nn.Module):
         inner_dim = (-(round(expansion_ratio * d_model * 2 / 3) // -256)) * 256
 
         # ── 학습 가능한 스텝 파라미터 ──────────────────────────────────
-        self.dt  = nn.Parameter(torch.tensor(float(dt)))   # Δt: scalar
+        # self.dt  = nn.Parameter(torch.tensor(float(dt)))   # Δt: scalar (고정값 1.0으로 대체)
 
         # ── 멀티헤드 선형 사영 ─────────────────────────────────────────
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
@@ -106,6 +106,8 @@ class AMK_Block(nn.Module):
         self.W_V = nn.Linear(d_model, d_model, bias=False)
         self.W_O = nn.Linear(d_model, d_model, bias=False)
         nn.init.xavier_uniform_(self.W_O.weight)
+        self.W_aux = nn.Linear(d_model, d_model, bias=False)
+        nn.init.xavier_uniform_(self.W_aux.weight)
 
         # ── ConvSwiGLU ───────────────────────────────────────────────
         # 선형 팽창: d → 2*inner_dim  (G 와 U 로 분할)
@@ -125,14 +127,18 @@ class AMK_Block(nn.Module):
         self.W_down = nn.Linear(inner_dim, d_model, bias=False)
 
         # ── 정규화 (Pre-Norm) ──────────────────────────────────────────
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
 
         # ── 시각화용 텔레메트리 (Visualization Telemetry) ────────────────
         self.log_viz = False
         self.viz_W = []
         self.viz_m = []
         self.viz_H = []  # H_context = LayerNorm(Q) + X — 실제 중력 작용 공간
+
+        # ── bypass 모니터링용 activation norm ────────────────────────────
+        self.last_m_norm: float = 0.0
+        self.last_C_norm: float = 0.0
 
     # ----------------------------------------------------------
     def forward(self, Q_in: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
@@ -148,11 +154,10 @@ class AMK_Block(nn.Module):
         d_h = self.head_dim
 
         # ══════════════════════════════════════════════════════
-        # Step 1: Pre-Norm + Information Injection
+        # Step 1: Information Injection (Q_in은 이전 블록에서 이미 정규화된 상태)
         # ══════════════════════════════════════════════════════
 
-        Q_norm1 = self.norm1(Q_in)                  # [B, N, d]
-        H_context = Q_norm1 + X                     # [B, N, d]
+        H_context = Q_in + X                        # [B, N, d]
 
         # ══════════════════════════════════════════════════════
         # Step 2: 멀티헤드 선형 사영 + 헤드 분할
@@ -173,7 +178,8 @@ class AMK_Block(nn.Module):
         # Step 4: 헤드별 다항식 인력 행렬
         # ══════════════════════════════════════════════════════
 
-        W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2))  # [B, H, N, N]
+        scale = self.head_dim ** -0.5
+        W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale  # [B, H, N, N]
         W = F.relu(W) ** self.kernel_power                  # [B, H, N, N]
 
         # ══════════════════════════════════════════════════════
@@ -181,7 +187,7 @@ class AMK_Block(nn.Module):
         # ══════════════════════════════════════════════════════
 
         Attraction = torch.matmul(W, V_proj)               # [B, H, N, d_h]
-        Norm = W.sum(dim=-1, keepdim=True) + 1.0            # [B, H, N, 1]
+        Norm = W.sum(dim=-1, keepdim=True) + 1e-6            # [B, H, N, 1]
         C = Attraction / Norm                               # [B, H, N, d_h]
         m = C - V_proj                                      # [B, H, N, d_h]
 
@@ -189,39 +195,40 @@ class AMK_Block(nn.Module):
         # Step 6: 헤드 병합 + 출력 사영 (W_O zero-init)
         # ══════════════════════════════════════════════════════
 
-        m_concat = m.transpose(1, 2).contiguous().view(B, N, d)  # [B, N, d]
-        m_proj = self.W_O(m_concat)                               # [B, N, d]
+        m_concat = m.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
+        C_concat = C.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
+        m_proj = self.W_O(m_concat) + self.W_aux(C_concat)                # [B, N, d]
+
+        self.last_m_norm = m_concat.detach().norm(dim=-1).mean().item()
+        self.last_C_norm = C_concat.detach().norm(dim=-1).mean().item()
 
         # ══════════════════════════════════════════════════════
-        # Step 7: PDE 상태 업데이트 (순수 잔차, 야코비안 I 보장)
+        # Step 7: 잔차 + Post-Addition Norm (분산 팽창 억제)
         # ══════════════════════════════════════════════════════
 
-        dt_safe = F.softplus(self.dt)
-        Q_interact = Q_in + dt_safe * m_proj  # [B, N, d]
+        Q_interact = self.norm1(Q_in + 1.0 * m_proj)  # [B, N, d]
 
-        # ── 시각화 캐싱 ──────────────────────────────────────────────────
+        # ── 시각화 캐싱 (헤드별 데이터 저장) ────────────────────────────────
         if self.log_viz:
-            W_avg = W.mean(dim=1)                          # [B, N, N] (헤드 평균)
-            Norm_avg = W_avg.sum(dim=-1, keepdim=True) + 1.0
-            self.viz_W.append(W_avg / Norm_avg)            # 정규화된 [B, N, N]
-            self.viz_m.append(m_concat)                    # concat 후, W_O 전
-            self.viz_H.append(H_context)                   # 중력 작용 공간
+            # 헤드별 정규화된 인력 행렬: [B, H, N, N]
+            W_norm = W / (W.sum(dim=-1, keepdim=True) + 1e-6)
+            self.viz_W.append(W_norm.detach())             # [B, H, N, N]
+            self.viz_m.append(m.detach())                  # [B, H, N, d_h] (헤드별)
+            self.viz_H.append(H_context)                   # [B, N, d]
             
         # ══════════════════════════════════════════════════════
         # Step 4: ConvSwiGLU with Micro-Residual
         # ══════════════════════════════════════════════════════
 
-        Q_norm2 = self.norm2(Q_interact)    # Pre-Norm for SwiGLU
-
-        # 선형 팽창 후 G / U 분할
-        GU = self.W_up(Q_norm2)             # [B, N, 2*m*d]
+        # 선형 팽창 후 G / U 분할 (Q_interact는 이미 norm1으로 정규화됨)
+        GU = self.W_up(Q_interact)          # [B, N, 2*m*d]
         G, U = GU.chunk(2, dim=-1)          # G: [B, N, m*d],  U: [B, N, m*d]
 
         # SwiGLU 게이팅
         H_ffn = F.silu(G) * U               # [B, N, m*d]
 
         # Depthwise Conv1D: (B, channels, length) 형식 필요
-        N = Q_norm2.shape[1]
+        N = Q_interact.shape[1]
         H_ffn_t  = H_ffn.transpose(1, 2)           # [B, inner, N]
         H_conv_t = self.dw_conv(H_ffn_t)           # [B, inner, N'] (패딩으로 길어질 수 있음)
         H_conv_t = F.silu(H_conv_t[..., :N])       # [B, inner, N] 슬라이싱 + 활성화
@@ -230,8 +237,8 @@ class AMK_Block(nn.Module):
         # 최종 투영
         H_out = self.W_down(H_conv)          # [B, N, d]
 
-        # Micro-Residual (필수)
-        Q_out = Q_interact + H_out           # [B, N, d]
+        # Micro-Residual + Post-Addition Norm (분산 팽창 억제)
+        Q_out = self.norm2(Q_interact + H_out)  # [B, N, d]
 
         return Q_out  # [B, N, d]
 
@@ -287,7 +294,7 @@ class AMKPDModel(nn.Module):
         # ── 토큰 임베딩 ───────────────────────────────────────────────
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.pos_emb     = nn.Embedding(8192, d_model)
-        self.input_norm  = nn.LayerNorm(d_model)
+        self.input_norm  = nn.RMSNorm(d_model)
 
         # ── Carry 리셋용 초기 벡터 (URM urm.py:101-104) ──────────────
         self.register_buffer(
@@ -309,7 +316,7 @@ class AMKPDModel(nn.Module):
         ])
 
         # ── 최종 출력 정규화 ──────────────────────────────────────────
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm = nn.RMSNorm(d_model)
 
         # ── Q Head (URM urm.py:81,107-108 패턴) ──────────────────────
         # 출력 2개: [q_halt_logit, q_continue_logit]
