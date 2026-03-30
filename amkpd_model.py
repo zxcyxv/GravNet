@@ -133,8 +133,18 @@ class AMK_Block(nn.Module):
         self.viz_H = []  # H_context = LayerNorm(Q) + X — 실제 중력 작용 공간
 
         # ── bypass 모니터링용 activation norm ────────────────────────────
-        self.last_m_norm: float = 0.0
-        self.last_C_norm: float = 0.0
+        self._last_m_norm: torch.Tensor | float = 0.0
+        self._last_C_norm: torch.Tensor | float = 0.0
+
+    @property
+    def last_m_norm(self) -> float:
+        v = self._last_m_norm
+        return v.item() if isinstance(v, torch.Tensor) else v
+
+    @property
+    def last_C_norm(self) -> float:
+        v = self._last_C_norm
+        return v.item() if isinstance(v, torch.Tensor) else v
 
     # ----------------------------------------------------------
     def forward(self, Q_in: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
@@ -202,8 +212,9 @@ class AMK_Block(nn.Module):
         C_concat = C.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
         m_proj = self.W_O_aux(torch.cat([m_concat, C_concat], dim=-1))    # [B, N, d]
 
-        self.last_m_norm = m_concat.detach().norm(dim=-1).mean().item()
-        self.last_C_norm = C_concat.detach().norm(dim=-1).mean().item()
+        # graph break 방지: .item() 없이 텐서로 저장
+        self._last_m_norm = m_concat.detach().norm(dim=-1).mean()
+        self._last_C_norm = C_concat.detach().norm(dim=-1).mean()
 
         # ══════════════════════════════════════════════════════
         # Step 7: 잔차 + Post-Addition Norm (분산 팽창 억제)
