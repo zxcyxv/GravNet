@@ -1,5 +1,5 @@
 checkpoints/
-data/
+data/*/
 visualizations/
 __pycache__/
 *.pt
