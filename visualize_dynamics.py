@@ -63,11 +63,8 @@ def tsallis_entropy(p, q=2.0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default="data/sudoku-extreme-1k-aug-1000")
-    parser.add_argument("--d_model", type=int, default=128)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("checkpoint", type=str, help="체크포인트 경로")
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--n_loops_viz", type=int, default=20,
                         help="Number of outer loops for visualization")
     args = parser.parse_args()
@@ -75,36 +72,47 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ── 1. Data ──
-    train_loader, test_loader, meta = create_dataloaders(
-        args.data_dir, args.batch_size, 0, device.type == "cuda"
-    )
+    # ── 1. Checkpoint loading ──
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    a = ckpt["args"]
 
-    # ── 2. Checkpoint loading ──
-    ckpt_args = {}
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        print(f"Loading checkpoint: {args.checkpoint}")
-        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        ckpt_args = ckpt.get("args", {})
-        args.d_model = ckpt_args.get("d_model", args.d_model)
-        args.num_heads = ckpt_args.get("num_heads", args.num_heads)
+    # ── 2. Data ──
+    train_loader, test_loader, meta = create_dataloaders(
+        a["data_dir"], args.batch_size, 0, device.type == "cuda"
+    )
 
     model = AMKPDModel(
         vocab_size=meta["vocab_size"],
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_layers=ckpt_args.get("num_layers", 3),
+        d_model=a["d_model"],
+        num_heads=a["num_heads"],
+        num_layers=a["num_layers"],
         loops=args.n_loops_viz,
-        H_cycles=ckpt_args.get("H_cycles", 2),
-        L_cycles=ckpt_args.get("L_cycles", 1),
-        kernel_power=ckpt_args.get("kernel_power", 2),
-        expansion_ratio=ckpt_args.get("expansion_ratio", 4),
-        conv_kernel_size=ckpt_args.get("conv_kernel", 3),
+        H_cycles=a["H_cycles"],
+        L_cycles=a["L_cycles"],
+        kernel_power=a["kernel_power"],
+        expansion_ratio=a["expansion_ratio"],
+        conv_kernel_size=a.get("conv_kernel", 2),
     ).to(device)
 
-    if args.checkpoint and os.path.exists(args.checkpoint):
-        model.load_state_dict(ckpt["model"])
-        print("Checkpoint loaded.")
+    # _orig_mod. prefix 제거 + old W_Q/W_K/W_V/W_O/W_aux → fused 변환
+    state = {}
+    for k, v in ckpt["model"].items():
+        k = k.replace("_orig_mod.", "")
+        state[k] = v
+    for bi in range(a["num_layers"]):
+        pfx = f"blocks.{bi}"
+        if f"{pfx}.W_Q.weight" in state:
+            state[f"{pfx}.W_QKV.weight"] = torch.cat([
+                state.pop(f"{pfx}.W_Q.weight"),
+                state.pop(f"{pfx}.W_K.weight"),
+                state.pop(f"{pfx}.W_V.weight"),
+            ], dim=0)
+            state[f"{pfx}.W_O_aux.weight"] = torch.cat([
+                state.pop(f"{pfx}.W_O.weight"),
+                state.pop(f"{pfx}.W_aux.weight"),
+            ], dim=1)
+    model.load_state_dict(state)
 
     model.eval()
 
@@ -115,7 +123,7 @@ def main():
     inputs = inputs[:B_viz].to(device)
     labels = labels[:B_viz].to(device)
     seq_len = inputs.shape[1]
-    H = args.num_heads
+    H = a["num_heads"]
 
     # Enable telemetry
     model.log_viz = True
@@ -173,7 +181,7 @@ def main():
 
     N_seq = seq_len  # 81
     n_loops_collected = len(W_per_head)
-    d_h = args.d_model // H
+    d_h = a["d_model"] // H
 
     print(f"Collected {n_loops_collected} micro-steps, {len(global_Q)} Q snapshots")
     print(f"Blanks: {len(blank_indices)}, Given: {given_mask.sum()}")
@@ -438,6 +446,7 @@ def main():
     print("[5/7] Class-Conditioned Neural Collapse Trajectory ...")
 
     from sklearn.decomposition import PCA
+    from sklearn.metrics import silhouette_score
     try:
         import umap
         HAS_UMAP = True
@@ -507,10 +516,85 @@ def main():
     plt.savefig("visualizations/05_class_conditioned_collapse.png", dpi=200)
     plt.close()
 
+    # ── NC1 / Silhouette 정량 메트릭 (루프별) ──
+    print("[5b/8] NC1 & Silhouette Score across loops ...")
+
+    def compute_nc1(features, labels):
+        """NC1 = Tr(Sigma_W) / Tr(Sigma_B)
+        Within-class / between-class variance ratio (scalar form).
+        Lower = better clustering. Numerically stable even when N < d.
+        """
+        classes = np.unique(labels)
+        global_mean = features.mean(axis=0)
+        N = features.shape[0]
+
+        sw = 0.0  # sum of within-class squared distances
+        sb = 0.0  # sum of between-class squared distances
+
+        for c in classes:
+            mask_c = (labels == c)
+            X_c = features[mask_c]
+            n_c = X_c.shape[0]
+            if n_c == 0:
+                continue
+            mu_c = X_c.mean(axis=0)
+            sw += np.sum((X_c - mu_c) ** 2)
+            sb += n_c * np.sum((mu_c - global_mean) ** 2)
+
+        sw /= N
+        sb /= N
+
+        if sb < 1e-12:
+            return float('inf')
+        return float(sw / sb)
+
+    nc1_history = []
+    silhouette_history = []
+
+    for c_idx in range(n_q):
+        Q_snap = global_Q[c_idx][0].numpy()  # [81, d], sample 0
+        labs = lbl_0  # [81]
+
+        # NC1
+        nc1_val = compute_nc1(Q_snap, labs)
+        nc1_history.append(nc1_val)
+
+        # Silhouette (requires >= 2 classes and >= 2 samples per class to be meaningful)
+        unique_labs = np.unique(labs)
+        if len(unique_labs) >= 2:
+            sil = silhouette_score(Q_snap, labs)
+            silhouette_history.append(float(sil))
+        else:
+            silhouette_history.append(0.0)
+
+    # Plot NC1 & Silhouette
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(range(n_q), nc1_history, 'r-o', markersize=3, linewidth=2)
+    ax1.set_xlabel("Q snapshot")
+    ax1.set_ylabel("NC1 (Tr(Σ_W) / Tr(Σ_B))")
+    ax1.set_title("NC1: Within/Between Class Variance Ratio\n(Lower = better digit clustering)")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(range(n_q), silhouette_history, 'b-o', markersize=3, linewidth=2)
+    ax2.set_xlabel("Q snapshot")
+    ax2.set_ylabel("Silhouette Score")
+    ax2.set_title("Silhouette Score\n(Higher = better digit clustering, max=1)")
+    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle("Hidden State Digit Clustering Metrics Across Loops", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/05b_nc1_silhouette.png", dpi=200)
+    plt.close()
+
+    metrics["nc1"] = nc1_history
+    metrics["silhouette"] = silhouette_history
+
     # ════════════════════════════════════════════════════════════════════
     # 6. Label-Sorted Attraction Matrix + Block Diagonal Ratio (BDR)
     # ════════════════════════════════════════════════════════════════════
-    print("[6/7] Label-Sorted Attraction Matrix + BDR ...")
+    print("[6/8] Label-Sorted Attraction Matrix + BDR ...")
 
     # ── BDR 계산 함수 ──
     # BDR = (같은 숫자 블록 내부 W 합) / (전체 W 합)
@@ -627,7 +711,7 @@ def main():
     # ════════════════════════════════════════════════════════════════════
     # 7. Spatial 2D Receptive Field (헤드별 9x9 그리드 인력)
     # ════════════════════════════════════════════════════════════════════
-    print("[7/7] Head-wise Spatial 2D Receptive Field ...")
+    print("[7/8] Head-wise Spatial 2D Receptive Field ...")
 
     # 빈칸 중 하나 선택
     target_q_idx = blank_indices[len(blank_indices) // 2]
@@ -698,6 +782,293 @@ def main():
     plt.savefig("visualizations/07_spatial_receptive_field.png", dpi=200)
     plt.close()
 
+    # ════════════════════════════════════════════════════════════════════
+    # 8. Particle Trajectory (입자 궤적 — 중력 이동 직접 시각화)
+    # ════════════════════════════════════════════════════════════════════
+    print("[8/10] Particle Trajectory in 2D ...")
+
+    # PCA를 마지막 Q에 fit → 모든 snapshot에 동일 projection 적용
+    from sklearn.decomposition import PCA as PCA2
+    pca_traj = PCA2(n_components=2)
+    Q_final = global_Q[-1][0].numpy()  # [81, d]
+    pca_traj.fit(Q_final)
+
+    # 모든 snapshot 투영
+    Q_projected = []  # list of [81, 2]
+    for c_idx in range(n_q):
+        Q_projected.append(pca_traj.transform(global_Q[c_idx][0].numpy()))
+
+    # ── 8a: 전체 궤적 (선택된 셀들) ──
+    # 빈칸 중 다양한 위치에서 셀 선택 (최대 12개)
+    selected_blanks = blank_indices[::max(1, len(blank_indices) // 6)][:6]
+    given_indices = np.where(given_mask)[0]
+    selected_given = given_indices[::max(1, len(given_indices) // 6)][:6]
+    selected_cells = np.concatenate([selected_blanks, selected_given])
+
+    fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+
+    # Panel 1: 궤적 + 화살표 (선택된 셀)
+    ax = axes[0]
+    cmap_digit = plt.get_cmap('tab10')
+
+    for cell_idx in selected_cells:
+        traj = np.array([Q_projected[t][cell_idx] for t in range(n_q)])  # [n_q, 2]
+        digit = lbl_0[cell_idx] - 1 if lbl_0[cell_idx] >= 2 else 0
+        color = cmap_digit(digit)
+        is_blank = not given_mask[cell_idx]
+        ls = '-' if is_blank else '--'
+        lw = 1.5 if is_blank else 0.8
+
+        # 궤적 선
+        ax.plot(traj[:, 0], traj[:, 1], color=color, linewidth=lw, linestyle=ls, alpha=0.6)
+        # 시작점 (삼각형)
+        ax.scatter(traj[0, 0], traj[0, 1], color=color, marker='^', s=40, zorder=5, alpha=0.8)
+        # 끝점 (원 or 별)
+        marker = 'o' if is_blank else '*'
+        ms = 60 if is_blank else 120
+        ax.scatter(traj[-1, 0], traj[-1, 1], color=color, marker=marker, s=ms,
+                   edgecolors='black', linewidth=0.5, zorder=6)
+        # 이동 화살표 (마지막 3 스텝)
+        for t in range(max(0, n_q - 4), n_q - 1):
+            dx = traj[t+1, 0] - traj[t, 0]
+            dy = traj[t+1, 1] - traj[t, 1]
+            ax.annotate('', xy=(traj[t+1, 0], traj[t+1, 1]),
+                        xytext=(traj[t, 0], traj[t, 1]),
+                        arrowprops=dict(arrowstyle='->', color=color, lw=1.2, alpha=0.7))
+
+    ax.set_title("Selected Cell Trajectories\n(△=start, ●=blank end, ★=given end)", fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 2: 전체 81셀의 시작→끝 이동 (화살표)
+    ax = axes[1]
+    for cell_idx in range(N_seq):
+        start = Q_projected[0][cell_idx]
+        end = Q_projected[-1][cell_idx]
+        digit = lbl_0[cell_idx] - 1 if lbl_0[cell_idx] >= 2 else 0
+        color = cmap_digit(digit)
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        ax.annotate('', xy=(end[0], end[1]), xytext=(start[0], start[1]),
+                    arrowprops=dict(arrowstyle='->', color=color, lw=0.8, alpha=0.5))
+        # 끝점만 표시
+        marker = 'o' if not given_mask[cell_idx] else '*'
+        ms = 20 if not given_mask[cell_idx] else 50
+        ax.scatter(end[0], end[1], color=color, marker=marker, s=ms, alpha=0.7, zorder=5)
+
+    ax.set_title("All 81 Cells: Start → End Displacement\n(arrows show total movement)", fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # Panel 3: 스냅샷 오버레이 (루프 진행에 따른 분포 변화)
+    ax = axes[2]
+    snap_indices = [0, n_q // 4, n_q // 2, n_q - 1]
+    snap_indices = sorted(set([min(s, n_q - 1) for s in snap_indices]))
+    alphas = np.linspace(0.15, 1.0, len(snap_indices))
+    sizes = np.linspace(10, 50, len(snap_indices))
+
+    for si, snap_idx in enumerate(snap_indices):
+        pts = Q_projected[snap_idx]
+        for cell_idx in range(N_seq):
+            digit = lbl_0[cell_idx] - 1 if lbl_0[cell_idx] >= 2 else 0
+            color = cmap_digit(digit)
+            ax.scatter(pts[cell_idx, 0], pts[cell_idx, 1],
+                       color=color, s=sizes[si], alpha=alphas[si], zorder=si + 1)
+        # 테두리로 스냅샷 구분
+        ax.scatter([], [], color='gray', s=sizes[si], alpha=alphas[si],
+                   label=f"Snap {snap_idx}")
+
+    ax.set_title("Snapshot Overlay (faint=early, bold=final)\n(colors=digit 1-9)", fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # 공통 범례
+    from matplotlib.lines import Line2D as Line2D2
+    legend_els = []
+    for c in range(1, 10):
+        legend_els.append(Line2D2([0], [0], marker='o', color='w',
+                                   markerfacecolor=cmap_digit(c), markersize=8, label=str(c)))
+    fig.legend(handles=legend_els, loc='lower center', ncol=9, fontsize=9)
+
+    plt.suptitle("Particle Dynamics: Cell Trajectories in Latent Space Across Loops", fontsize=14)
+    plt.tight_layout(rect=[0, 0.05, 1, 0.93])
+    plt.savefig("visualizations/08_particle_trajectories.png", dpi=200)
+    plt.close()
+
+    # ════════════════════════════════════════════════════════════════════
+    # 9. Force Convergence (||m|| 감소 = 평형 도달 증거)
+    # ════════════════════════════════════════════════════════════════════
+    print("[9/10] Force Convergence ||m|| ...")
+
+    # m_per_head[step][block] = [B, H, N, d_h]
+    # 각 micro-step에서의 평균 ||m|| 계산
+    force_norm_history = []       # 전체 평균
+    force_norm_blank = []         # 빈칸만
+    force_norm_given = []         # 주어진 셀만
+
+    for step_idx in range(n_loops_collected):
+        m_step = m_per_head[step_idx][-1][0].numpy()  # [H, N, d_h], sample 0
+        # 헤드 평균 후 셀별 norm
+        m_avg = m_step.mean(axis=0)  # [N, d_h]
+        norms = np.linalg.norm(m_avg, axis=-1)  # [N]
+
+        force_norm_history.append(float(norms.mean()))
+        force_norm_blank.append(float(norms[~given_mask].mean()))
+        force_norm_given.append(float(norms[given_mask].mean()))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    steps_x = range(1, n_loops_collected + 1)
+    ax1.plot(steps_x, force_norm_history, 'k-o', markersize=3, linewidth=2, label='All cells')
+    ax1.plot(steps_x, force_norm_blank, 'r-s', markersize=3, linewidth=1.5, label='Blank cells')
+    ax1.plot(steps_x, force_norm_given, 'b-^', markersize=3, linewidth=1.5, label='Given cells')
+    ax1.set_xlabel("Micro-step")
+    ax1.set_ylabel("Mean ||m|| (force magnitude)")
+    ax1.set_title("Mean-Shift Force Magnitude Across Loops\n(Decreasing = approaching equilibrium)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 이동 거리 (Q snapshot 간 L2 거리)
+    displacement_history = []
+    displacement_blank = []
+    displacement_given = []
+
+    for t in range(1, n_q):
+        Q_prev = global_Q[t-1][0].numpy()  # [81, d]
+        Q_curr = global_Q[t][0].numpy()
+        disp = np.linalg.norm(Q_curr - Q_prev, axis=-1)  # [81]
+        displacement_history.append(float(disp.mean()))
+        displacement_blank.append(float(disp[~given_mask].mean()))
+        displacement_given.append(float(disp[given_mask].mean()))
+
+    ax2.plot(range(1, n_q), displacement_history, 'k-o', markersize=3, linewidth=2, label='All cells')
+    ax2.plot(range(1, n_q), displacement_blank, 'r-s', markersize=3, linewidth=1.5, label='Blank cells')
+    ax2.plot(range(1, n_q), displacement_given, 'b-^', markersize=3, linewidth=1.5, label='Given cells')
+    ax2.set_xlabel("Q snapshot")
+    ax2.set_ylabel("Mean ||ΔQ|| (displacement per step)")
+    ax2.set_title("Cell Displacement Per Loop Step\n(Decreasing = convergence to fixed point)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle("Dynamical System Convergence: Force & Displacement", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/09_force_convergence.png", dpi=200)
+    plt.close()
+
+    metrics["force_norm_all"] = force_norm_history
+    metrics["force_norm_blank"] = force_norm_blank
+    metrics["force_norm_given"] = force_norm_given
+    metrics["displacement_all"] = displacement_history
+    metrics["displacement_blank"] = displacement_blank
+    metrics["displacement_given"] = displacement_given
+
+    # ════════════════════════════════════════════════════════════════════
+    # 10. Unsupervised Clustering Emergence (라벨 없이 뭉침 검증)
+    # ════════════════════════════════════════════════════════════════════
+    print("[10/10] Unsupervised Clustering Emergence ...")
+
+    from sklearn.neighbors import NearestNeighbors
+
+    def hopkins_statistic(X, n_samples=None):
+        """Hopkins statistic: 0.5 = uniform random, →1.0 = clustered."""
+        n, d = X.shape
+        if n_samples is None:
+            n_samples = min(n // 2, 30)
+        if n_samples < 2:
+            return 0.5
+
+        rng = np.random.RandomState(42)
+
+        # Sample n_samples points from X
+        sample_idx = rng.choice(n, n_samples, replace=False)
+        X_sample = X[sample_idx]
+
+        # Generate n_samples uniform random points in the data bounding box
+        X_min = X.min(axis=0)
+        X_max = X.max(axis=0)
+        X_random = rng.uniform(X_min, X_max, (n_samples, d))
+
+        # Nearest neighbor distances
+        nn = NearestNeighbors(n_neighbors=2).fit(X)
+
+        # For real samples: distance to nearest OTHER point in X
+        u_dist = nn.kneighbors(X_sample, n_neighbors=2)[0][:, 1]  # skip self
+        # For random points: distance to nearest point in X
+        w_dist = nn.kneighbors(X_random, n_neighbors=1)[0][:, 0]
+
+        u_sum = u_dist.sum()
+        w_sum = w_dist.sum()
+
+        return float(w_sum / (u_sum + w_sum + 1e-12))
+
+    def pairwise_distance_cv(X):
+        """Coefficient of variation of pairwise distances.
+        Higher = more structure (some close + some far)."""
+        from scipy.spatial.distance import pdist
+        dists = pdist(X)
+        if len(dists) == 0 or dists.std() < 1e-12:
+            return 0.0
+        return float(dists.std() / (dists.mean() + 1e-12))
+
+    def constraint_vs_nonconstraint_distance(X, mask_given):
+        """제약 이웃 vs 비이웃 간 평균 거리 비율.
+        < 1.0 이면 제약 이웃끼리 더 가까움."""
+        from scipy.spatial.distance import cdist
+        D = cdist(X, X)  # [81, 81]
+        constraint_dists = []
+        non_constraint_dists = []
+        for i in range(81):
+            neighbors = set(get_row_indices(i)) | set(get_col_indices(i)) | set(get_box_indices(i))
+            non_neighbors = set(range(81)) - neighbors - {i}
+            for j in neighbors:
+                constraint_dists.append(D[i, j])
+            for j in non_neighbors:
+                non_constraint_dists.append(D[i, j])
+        c_mean = np.mean(constraint_dists) if constraint_dists else 1.0
+        nc_mean = np.mean(non_constraint_dists) if non_constraint_dists else 1.0
+        return float(c_mean / (nc_mean + 1e-12))
+
+    hopkins_history = []
+    cv_history = []
+    constraint_ratio_history = []
+
+    for c_idx in range(n_q):
+        Q_snap = global_Q[c_idx][0].numpy()
+        hopkins_history.append(hopkins_statistic(Q_snap))
+        cv_history.append(pairwise_distance_cv(Q_snap))
+        constraint_ratio_history.append(
+            constraint_vs_nonconstraint_distance(Q_snap, given_mask))
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 5))
+
+    ax1.plot(range(n_q), hopkins_history, 'g-o', markersize=3, linewidth=2)
+    ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.6, label='Random (no structure)')
+    ax1.set_xlabel("Q snapshot")
+    ax1.set_ylabel("Hopkins Statistic")
+    ax1.set_title("Hopkins Statistic\n(0.5=random, →1.0=clusters exist)")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(range(n_q), cv_history, 'm-o', markersize=3, linewidth=2)
+    ax2.set_xlabel("Q snapshot")
+    ax2.set_ylabel("Pairwise Distance CV (σ/μ)")
+    ax2.set_title("Pairwise Distance Variation\n(Higher = more spatial structure)")
+    ax2.grid(True, alpha=0.3)
+
+    ax3.plot(range(n_q), constraint_ratio_history, 'c-o', markersize=3, linewidth=2)
+    ax3.axhline(y=1.0, color='gray', linestyle='--', alpha=0.6, label='No preference')
+    ax3.set_xlabel("Q snapshot")
+    ax3.set_ylabel("Constraint / Non-constraint Distance Ratio")
+    ax3.set_title("Constraint Neighbor Proximity\n(<1.0 = constraint neighbors closer)")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.suptitle("Unsupervised Structure Emergence Across Loops", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    plt.savefig("visualizations/10_clustering_emergence.png", dpi=200)
+    plt.close()
+
+    metrics["hopkins"] = hopkins_history
+    metrics["pairwise_distance_cv"] = cv_history
+    metrics["constraint_neighbor_ratio"] = constraint_ratio_history
+
     # ── Save metrics ──
     with open("visualizations/metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
@@ -710,8 +1081,13 @@ def main():
     print(f"  04_head_orthogonality_heatmaps.png   - H x H cosine sim matrices")
     print(f"  04_head_orthogonality_trend.png      - Off-diagonal trend")
     print(f"  05_class_conditioned_collapse.png    - Neural Collapse trajectory")
+    print(f"  05b_nc1_silhouette.png               - NC1 & Silhouette digit clustering")
     print(f"  06_label_sorted_attraction.png       - Block-diagonal check")
+    print(f"  06_bdr_trend.png                     - BDR/CPR/RPR trend")
     print(f"  07_spatial_receptive_field.png        - 9x9 receptive field per head")
+    print(f"  08_particle_trajectories.png         - Cell trajectories in latent 2D")
+    print(f"  09_force_convergence.png             - ||m|| and ||ΔQ|| convergence")
+    print(f"  10_clustering_emergence.png          - Hopkins, CV, constraint proximity")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.4.3",
     "torch>=2.8.0",
     # "triton>=3.0.0",  # Linux 서버에서만 설치 (torch.compile용)
+    "scikit-learn>=1.6.0",
     "tqdm>=4.67.3",
 ]
 

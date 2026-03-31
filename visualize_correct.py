@@ -110,7 +110,24 @@ def main():
         L_cycles=a["L_cycles"], kernel_power=a["kernel_power"],
         expansion_ratio=a["expansion_ratio"], conv_kernel_size=a.get("conv_kernel", 2),
     ).to(device)
-    model.load_state_dict(ckpt["model"])
+    # _orig_mod. prefix 제거 + old W_Q/W_K/W_V/W_O/W_aux → fused 변환
+    state = {}
+    for k, v in ckpt["model"].items():
+        k = k.replace("_orig_mod.", "")
+        state[k] = v
+    for bi in range(a["num_layers"]):
+        pfx = f"blocks.{bi}"
+        if f"{pfx}.W_Q.weight" in state:
+            state[f"{pfx}.W_QKV.weight"] = torch.cat([
+                state.pop(f"{pfx}.W_Q.weight"),
+                state.pop(f"{pfx}.W_K.weight"),
+                state.pop(f"{pfx}.W_V.weight"),
+            ], dim=0)
+            state[f"{pfx}.W_O_aux.weight"] = torch.cat([
+                state.pop(f"{pfx}.W_O.weight"),
+                state.pop(f"{pfx}.W_aux.weight"),
+            ], dim=1)
+    model.load_state_dict(state)
     model.eval()
 
     B, seq_len = inputs.shape
