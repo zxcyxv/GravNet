@@ -50,6 +50,22 @@ class AMKPDCarry:
     current_labels: torch.Tensor   # [B, N] long — 저장된 정답 라벨
 
 
+def sparsemax(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Sparsemax activation (Martins & Astudillo, 2016).
+    Projects z onto the probability simplex with possible sparse outputs.
+    """
+    K = z.shape[dim]
+    z_sorted, _ = z.sort(dim=dim, descending=True)
+    z_cumsum = z_sorted.cumsum(dim=dim)
+    shape = [1] * z.dim()
+    shape[dim] = K
+    k_range = torch.arange(1, K + 1, device=z.device, dtype=z.dtype).view(shape)
+    valid = (1.0 + k_range * z_sorted > z_cumsum)
+    k_z = valid.sum(dim=dim, keepdim=True).clamp(min=1)
+    tau = (z_cumsum.gather(dim, k_z - 1) - 1.0) / k_z.to(z.dtype)
+    return (z - tau).clamp(min=0.0)
+
+
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -102,7 +118,7 @@ class AMK_Block(nn.Module):
 
         # ── 멀티헤드 선형 사영 (QKV fused) ────────────────────────────────
         self.W_QKV = nn.Linear(d_model, 3 * d_model, bias=False)
-        self.W_O_aux = nn.Linear(2 * d_model, d_model, bias=False)
+        self.W_O_aux = nn.Linear(d_model, d_model, bias=False)
         nn.init.xavier_uniform_(self.W_O_aux.weight)
 
         # ── ConvSwiGLU ───────────────────────────────────────────────
@@ -186,22 +202,13 @@ class AMK_Block(nn.Module):
         # ══════════════════════════════════════════════════════
 
         scale = self.head_dim ** -0.5
-        W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale  # [B, H, N, N]
-        W = F.relu(W)
-        if self.kernel_power == 2:
-            W = W * W
-        elif self.kernel_power == 4:
-            W = W * W; W = W * W
-        elif self.kernel_power != 1:
-            W = W ** self.kernel_power
+        W = sparsemax(torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale)  # [B, H, N, N]
 
         # ══════════════════════════════════════════════════════
         # Step 5: 헤드별 Mean Shift
         # ══════════════════════════════════════════════════════
 
-        Attraction = torch.matmul(W, V_proj)               # [B, H, N, d_h]
-        Norm = W.sum(dim=-1, keepdim=True) + 1e-6            # [B, H, N, 1]
-        C = Attraction / Norm                               # [B, H, N, d_h]
+        C = torch.matmul(W, V_proj)                          # [B, H, N, d_h]  (sparsemax sums to 1)
         m = C - V_proj                                      # [B, H, N, d_h]
 
         # ══════════════════════════════════════════════════════
@@ -209,12 +216,11 @@ class AMK_Block(nn.Module):
         # ══════════════════════════════════════════════════════
 
         m_concat = m.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
-        C_concat = C.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
-        m_proj = self.W_O_aux(torch.cat([m_concat, C_concat], dim=-1))    # [B, N, d]
+        m_proj = self.W_O_aux(m_concat)                                    # [B, N, d]
 
         # graph break 방지: .item() 없이 텐서로 저장
         self._last_m_norm = m_concat.detach().norm(dim=-1).mean()
-        self._last_C_norm = C_concat.detach().norm(dim=-1).mean()
+        self._last_C_norm = C.detach().transpose(1, 2).contiguous().view(B, N, d).norm(dim=-1).mean()
 
         # ══════════════════════════════════════════════════════
         # Step 7: 잔차 + Post-Addition Norm (분산 팽창 억제)
@@ -224,9 +230,8 @@ class AMK_Block(nn.Module):
 
         # ── 시각화 캐싱 (헤드별 데이터 저장) ────────────────────────────────
         if self.log_viz:
-            # 헤드별 정규화된 인력 행렬: [B, H, N, N]
-            W_norm = W / (W.sum(dim=-1, keepdim=True) + 1e-6)
-            self.viz_W.append(W_norm.detach())             # [B, H, N, N]
+            # sparsemax W는 이미 확률 분포 (합=1)
+            self.viz_W.append(W.detach())                  # [B, H, N, N]
             self.viz_m.append(m.detach())                  # [B, H, N, d_h] (헤드별)
             self.viz_H.append(H_context)                   # [B, N, d]
             
