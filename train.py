@@ -54,9 +54,9 @@ def parse_args() -> argparse.Namespace:
 
     # ── 모델 아키텍처 ─────────────────────────────────────────────────────
     g = p.add_argument_group("Model")
-    g.add_argument("--d_model",         type=int,   default=128,  help="은닉 차원 d")
+    g.add_argument("--d_model",         type=int,   default=384,  help="은닉 차원 d")
     g.add_argument("--num_heads",       type=int,   default=8,    help="멀티헤드 어텐션 헤드 수")
-    g.add_argument("--num_layers",      type=int,   default=4,    help="K: L_cycle당 블록 수")
+    g.add_argument("--num_layers",      type=int,   default=6,    help="K: L_cycle당 블록 수")
     g.add_argument("--loops",           type=int,   default=16,   help="외부 루프 최대 횟수")
     g.add_argument("--H_cycles",        type=int,   default=2,    help="중간 루프 (H-1회 no_grad + 1회 grad)")
     g.add_argument("--L_cycles",        type=int,   default=6,    help="내부 루프 (X 주입 + 블록 통과)")
@@ -155,7 +155,7 @@ def build_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or any(k in name for k in ("bias", "norm")):
+        if param.ndim <= 1 or any(k in name for k in ("bias",)):
             no_decay_params.append(param)
         else:
             decay_params.append(param)

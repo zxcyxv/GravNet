@@ -50,22 +50,6 @@ class AMKPDCarry:
     current_labels: torch.Tensor   # [B, N] long — 저장된 정답 라벨
 
 
-def sparsemax(z: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Sparsemax activation (Martins & Astudillo, 2016).
-    Projects z onto the probability simplex with possible sparse outputs.
-    """
-    K = z.shape[dim]
-    z_sorted, _ = z.sort(dim=dim, descending=True)
-    z_cumsum = z_sorted.cumsum(dim=dim)
-    shape = [1] * z.dim()
-    shape[dim] = K
-    k_range = torch.arange(1, K + 1, device=z.device, dtype=z.dtype).view(shape)
-    valid = (1.0 + k_range * z_sorted > z_cumsum)
-    k_z = valid.sum(dim=dim, keepdim=True).clamp(min=1)
-    tau = (z_cumsum.gather(dim, k_z - 1) - 1.0) / k_z.to(z.dtype)
-    return (z - tau).clamp(min=0.0)
-
-
 def rotate_half(x):
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
@@ -163,11 +147,10 @@ class AMK_Block(nn.Module):
         return v.item() if isinstance(v, torch.Tensor) else v
 
     # ----------------------------------------------------------
-    def forward(self, Q_in: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
+    def forward(self, Q_in: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Q_in : [B, N, d]  현재 은닉 상태 (Q 누적기)
-            X    : [B, N, d]  입력 앵커 (디리클레 경계 조건)
+            Q_in : [B, N, d]  현재 은닉 상태 (입력 주입은 L_cycle 레벨에서 수행)
         Returns:
             Q_out: [B, N, d]  업데이트된 은닉 상태
         """
@@ -176,16 +159,10 @@ class AMK_Block(nn.Module):
         d_h = self.head_dim
 
         # ══════════════════════════════════════════════════════
-        # Step 1: Information Injection (Q_in은 이전 블록에서 이미 정규화된 상태)
+        # Step 1: 멀티헤드 선형 사영 + 헤드 분할 (fused QKV)
         # ══════════════════════════════════════════════════════
 
-        H_context = Q_in + X                        # [B, N, d]
-
-        # ══════════════════════════════════════════════════════
-        # Step 2: 멀티헤드 선형 사영 + 헤드 분할 (fused QKV)
-        # ══════════════════════════════════════════════════════
-
-        qkv = self.W_QKV(H_context).view(B, N, 3, H, d_h)
+        qkv = self.W_QKV(Q_in).view(B, N, 3, H, d_h)
         Q_proj = qkv[:, :, 0].transpose(1, 2)  # [B, H, N, d_h]
         K_proj = qkv[:, :, 1].transpose(1, 2)  # [B, H, N, d_h]
         V_proj = qkv[:, :, 2].transpose(1, 2)  # [B, H, N, d_h]
@@ -202,13 +179,22 @@ class AMK_Block(nn.Module):
         # ══════════════════════════════════════════════════════
 
         scale = self.head_dim ** -0.5
-        W = sparsemax(torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale)  # [B, H, N, N]
+        W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale  # [B, H, N, N]
+        W = F.relu(W)
+        if self.kernel_power == 2:
+            W = W * W
+        elif self.kernel_power == 4:
+            W = W * W; W = W * W
+        elif self.kernel_power != 1:
+            W = W ** self.kernel_power
 
         # ══════════════════════════════════════════════════════
         # Step 5: 헤드별 Mean Shift
         # ══════════════════════════════════════════════════════
 
-        C = torch.matmul(W, V_proj)                          # [B, H, N, d_h]  (sparsemax sums to 1)
+        Attraction = torch.matmul(W, V_proj)               # [B, H, N, d_h]
+        Norm = W.sum(dim=-1, keepdim=True) + 1e-6            # [B, H, N, 1]
+        C = Attraction / Norm                               # [B, H, N, d_h]
         m = C - V_proj                                      # [B, H, N, d_h]
 
         # ══════════════════════════════════════════════════════
@@ -230,10 +216,11 @@ class AMK_Block(nn.Module):
 
         # ── 시각화 캐싱 (헤드별 데이터 저장) ────────────────────────────────
         if self.log_viz:
-            # sparsemax W는 이미 확률 분포 (합=1)
-            self.viz_W.append(W.detach())                  # [B, H, N, N]
+            # 헤드별 정규화된 인력 행렬: [B, H, N, N]
+            W_norm = W / (W.sum(dim=-1, keepdim=True) + 1e-6)
+            self.viz_W.append(W_norm.detach())             # [B, H, N, N]
             self.viz_m.append(m.detach())                  # [B, H, N, d_h] (헤드별)
-            self.viz_H.append(H_context)                   # [B, N, d]
+            self.viz_H.append(Q_in.detach())               # [B, N, d]
             
         # ══════════════════════════════════════════════════════
         # Step 4: ConvSwiGLU with Micro-Residual
@@ -334,9 +321,6 @@ class AMKPDModel(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # ── 최종 출력 정규화 ──────────────────────────────────────────
-        self.final_norm = nn.RMSNorm(d_model)
-
         # ── Q Head (URM urm.py:81,107-108 패턴) ──────────────────────
         # 출력 2개: [q_halt_logit, q_continue_logit]
         self.halt_head = nn.Linear(d_model, 2)
@@ -390,10 +374,10 @@ class AMKPDModel(nn.Module):
         return replace(carry, current_hidden=new_hidden)
 
     # ----------------------------------------------------------
-    def _run_blocks(self, Q: torch.Tensor, X: torch.Tensor) -> torch.Tensor:
-        """K개 블록 순차 통과 = 1 L_cycle의 블록 체인 (X는 각 블록 내부 정보 공간에 주입)"""
+    def _run_blocks(self, Q: torch.Tensor) -> torch.Tensor:
+        """K개 블록 순차 통과 = 1 L_cycle의 블록 체인"""
         for block in self.blocks:
-            Q = block(Q, X)
+            Q = block(Q)
         return Q
 
     # ----------------------------------------------------------
@@ -441,7 +425,8 @@ class AMKPDModel(nn.Module):
             with ctx:
                 for _h in range(self.H_cycles - 1):
                     for _l in range(self.L_cycles):
-                        Q = self._run_blocks(Q, X)    # X는 블록 내부 정보 공간에 주입
+                        Q = Q + X                     # L_cycle 시작 시 입력 주입
+                        Q = self._run_blocks(Q)
 
         # 마지막 1 H_cycle: gradient 추적 (URM urm.py:159-162)
         if self.log_viz:
@@ -452,7 +437,8 @@ class AMKPDModel(nn.Module):
             self.viz_Q.append(Q.detach())
 
         for _l in range(self.L_cycles):
-            Q = self._run_blocks(Q, X)            # X는 블록 내부 정보 공간에 주입
+            Q = Q + X                             # L_cycle 시작 시 입력 주입
+            Q = self._run_blocks(Q)
 
             if self.log_viz:
                 self.viz_Q.append(Q.detach())
@@ -460,11 +446,10 @@ class AMKPDModel(nn.Module):
                     self.viz_H_global.append(self.blocks[-1].viz_H[-1])
 
         # ── Step D: 출력 헤드 ─────────────────────────────────────────
-        Q_norm = self.final_norm(Q)                        # [B, N, d]
-        logits = self.lm_head(Q_norm)                      # [B, N, vocab_size]
+        logits = self.lm_head(Q)                           # [B, N, vocab_size]
 
         # URM urm.py:166 — 첫 번째 토큰 기준 Q값 (AMK-PD는 mean pooling 사용)
-        q_logits = self.halt_head(Q_norm.mean(dim=1))      # [B, 2]
+        q_logits = self.halt_head(Q.mean(dim=1))           # [B, 2]
         q_halt_logits    = q_logits[..., 0]                # [B]
         q_continue_logits = q_logits[..., 1]               # [B]
 
