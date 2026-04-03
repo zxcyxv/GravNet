@@ -19,40 +19,6 @@ from dataclasses import dataclass, replace
 
 
 # ============================================================
-# 유틸리티 (URM에서 이식)
-# ============================================================
-
-def trunc_normal_init_(tensor: torch.Tensor, std: float = 1.0, lower: float = -2.0, upper: float = 2.0):
-    """Truncated LeCun Normal 초기화 (JAX 방식, URM models/common.py 원본)."""
-    with torch.no_grad():
-        if std == 0:
-            tensor.zero_()
-        else:
-            sqrt2 = math.sqrt(2)
-            a = math.erf(lower / sqrt2)
-            b = math.erf(upper / sqrt2)
-            z = (b - a) / 2
-            c = (2 * math.pi) ** -0.5
-            pdf_u = c * math.exp(-0.5 * lower ** 2)
-            pdf_l = c * math.exp(-0.5 * upper ** 2)
-            comp_std = std / math.sqrt(1 - (upper * pdf_u - lower * pdf_l) / z - ((pdf_u - pdf_l) / z) ** 2)
-            tensor.uniform_(a, b)
-            tensor.erfinv_()
-            tensor.mul_(sqrt2 * comp_std)
-            tensor.clip_(lower * comp_std, upper * comp_std)
-    return tensor
-
-
-def rms_norm(hidden_states: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-    """파라미터 없는 RMSNorm (URM models/layers.py 원본)."""
-    input_dtype = hidden_states.dtype
-    hidden_states = hidden_states.to(torch.float32)
-    variance = hidden_states.square().mean(-1, keepdim=True)
-    hidden_states = hidden_states * torch.rsqrt(variance + eps)
-    return hidden_states.to(input_dtype)
-
-
-# ============================================================
 # RoPE (Rotary Positional Embedding)
 # ============================================================
 
@@ -137,6 +103,7 @@ class AMK_Block(nn.Module):
         # ── 멀티헤드 선형 사영 (QKV fused) ────────────────────────────────
         self.W_QKV = nn.Linear(d_model, 3 * d_model, bias=False)
         self.W_O_aux = nn.Linear(d_model, d_model, bias=False)
+        nn.init.xavier_uniform_(self.W_O_aux.weight)
 
         # ── ConvSwiGLU ───────────────────────────────────────────────
         # 선형 팽창: d → 2*inner_dim  (G 와 U 로 분할)
@@ -155,7 +122,9 @@ class AMK_Block(nn.Module):
         # 최종 투영: inner_dim → d
         self.W_down = nn.Linear(inner_dim, d_model, bias=False)
 
-        # ── 정규화: 파라미터 없는 rms_norm (URM과 동일) ──────────────────
+        # ── 정규화 (Pre-Norm) ──────────────────────────────────────────
+        self.norm1 = nn.RMSNorm(d_model)
+        self.norm2 = nn.RMSNorm(d_model)
 
         # ── 시각화용 텔레메트리 (Visualization Telemetry) ────────────────
         self.log_viz = False
@@ -243,7 +212,7 @@ class AMK_Block(nn.Module):
         # Step 7: 잔차 + Post-Addition Norm (분산 팽창 억제)
         # ══════════════════════════════════════════════════════
 
-        Q_interact = rms_norm(Q_in + m_proj)  # [B, N, d]
+        Q_interact = self.norm1(Q_in + 1.0 * m_proj)  # [B, N, d]
 
         # ── 시각화 캐싱 (헤드별 데이터 저장) ────────────────────────────────
         if self.log_viz:
@@ -275,7 +244,7 @@ class AMK_Block(nn.Module):
         H_out = self.W_down(H_conv)          # [B, N, d]
 
         # Micro-Residual + Post-Addition Norm (분산 팽창 억제)
-        Q_out = rms_norm(Q_interact + H_out)  # [B, N, d]
+        Q_out = self.norm2(Q_interact + H_out)  # [B, N, d]
 
         return Q_out  # [B, N, d]
 
@@ -328,15 +297,15 @@ class AMKPDModel(nn.Module):
         self.L_cycles   = L_cycles     # 내부 루프
         self.burn_in_no_grad = True    # H_cycles-1 burn-in 시 no_grad 사용 여부
 
-        # ── 토큰 임베딩 (URM: √d 스케일링, input_norm 없음) ─────────────
-        self.embed_scale = math.sqrt(d_model)
+        # ── 토큰 임베딩 ───────────────────────────────────────────────
         self.embedding   = nn.Embedding(vocab_size, d_model)
         self.pos_emb     = nn.Embedding(8192, d_model)
+        self.input_norm  = nn.RMSNorm(d_model)
 
         # ── Carry 리셋용 초기 벡터 (URM urm.py:101-104) ──────────────
         self.register_buffer(
             'init_hidden',
-            trunc_normal_init_(torch.empty(d_model), std=1.0),
+            torch.randn(d_model) * 0.02,
         )
 
         # ── K 개의 AMK_Block (루프 간 가중치 공유) ────────────────────
@@ -369,33 +338,12 @@ class AMKPDModel(nn.Module):
 
     # ----------------------------------------------------------
     def _init_weights(self):
-        """URM과 동일한 Truncated LeCun Normal 초기화."""
-        d = self.d_model
-        embed_std = 1.0 / math.sqrt(d)  # 1/√d (URM embed_init_std)
-
-        # 임베딩 / LM head
-        trunc_normal_init_(self.embedding.weight, std=embed_std)
-        trunc_normal_init_(self.pos_emb.weight, std=embed_std)
-        trunc_normal_init_(self.lm_head.weight, std=1.0 / math.sqrt(d))
-
-        # Q head: weight=0, bias=-5 (URM urm.py:107-108)
+        nn.init.normal_(self.embedding.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
+        nn.init.normal_(self.lm_head.weight, std=0.02)
+        # q_head: weight=0, bias=-5 두 출력 모두 (URM urm.py:107-108)
         nn.init.zeros_(self.halt_head.weight)
         nn.init.constant_(self.halt_head.bias, -5.0)
-
-        # 블록 내부 가중치
-        for block in self.blocks:
-            hidden = block.d_model
-            std_h = 1.0 / math.sqrt(hidden)
-            inner_dim = block.W_down.in_features
-            std_inter = 1.0 / math.sqrt(inner_dim)
-
-            # QKV, O_aux
-            trunc_normal_init_(block.W_QKV.weight, std=std_h)
-            trunc_normal_init_(block.W_O_aux.weight, std=std_h)
-
-            # ConvSwiGLU: gate_up → std_h, down → std_inter
-            trunc_normal_init_(block.W_up.weight, std=std_h)
-            trunc_normal_init_(block.W_down.weight, std=std_inter)
 
     # ----------------------------------------------------------
     def initial_carry(
@@ -465,7 +413,8 @@ class AMKPDModel(nn.Module):
         # ── Step B: 입력 임베딩 (current_inputs 기준) ─────────────────
         seq_len = new_inputs.shape[1]
         pos = torch.arange(seq_len, device=new_inputs.device).unsqueeze(0)
-        X = self.embed_scale * self.embedding(new_inputs) + self.pos_emb(pos)  # [B, N, d]
+        X = self.embedding(new_inputs) + self.pos_emb(pos)
+        X = self.input_norm(X)  # [B, N, d]
 
         Q = new_carry.current_hidden  # [B, N, d]
 

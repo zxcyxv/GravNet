@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
 
     # ── 모델 아키텍처 ─────────────────────────────────────────────────────
     g = p.add_argument_group("Model")
-    g.add_argument("--d_model",         type=int,   default=512,  help="은닉 차원 d")
+    g.add_argument("--d_model",         type=int,   default=384,  help="은닉 차원 d")
     g.add_argument("--num_heads",       type=int,   default=8,    help="어텐션 헤드 수")
     g.add_argument("--num_layers",      type=int,   default=4,    help="블록 수")
     g.add_argument("--loops",           type=int,   default=16,   help="외부 루프 최대 횟수")
