@@ -33,6 +33,25 @@ from dataset import create_dataloaders, vectorized_sudoku_augment, SudokuDataset
 from torch.utils.data import DataLoader
 
 
+def build_model(args_dict: dict, vocab_size: int) -> AMKPDModel:
+    """체크포인트의 args dict 또는 argparse.Namespace로부터 AMKPDModel 생성."""
+    if not isinstance(args_dict, dict):
+        args_dict = vars(args_dict)
+    return AMKPDModel(
+        vocab_size=vocab_size,
+        d_model=args_dict["d_model"],
+        num_heads=args_dict["num_heads"],
+        num_layers=args_dict["num_layers"],
+        loops=args_dict["loops"],
+        H_cycles=args_dict.get("H_cycles", 2),
+        L_cycles=args_dict.get("L_cycles", 1),
+        dt=args_dict.get("dt", 1.0),
+        kernel_power=args_dict.get("kernel_power", 2),
+        expansion_ratio=args_dict.get("expansion_ratio", 4),
+        conv_kernel_size=args_dict.get("conv_kernel", 2),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +307,7 @@ def evaluate(
                 carry, logits, q_logits = model(carry, batch)
 
         _, loss_log = compute_loss(logits, q_logits, carry.current_labels, args)
-        total_loss += loss_log["loss"]
+        total_loss += loss_log["main_loss"]
 
         m = compute_metrics(logits, carry.current_labels)
         mask = carry.current_labels != 0
@@ -383,19 +402,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # ── 모델 ──────────────────────────────────────────────────────────────
-    model = AMKPDModel(
-        vocab_size=meta["vocab_size"],
-        d_model=args.d_model,
-        num_heads=args.num_heads,
-        num_layers=args.num_layers,
-        loops=args.loops,
-        H_cycles=args.H_cycles,
-        L_cycles=args.L_cycles,
-        dt=args.dt,
-        kernel_power=args.kernel_power,
-        expansion_ratio=args.expansion_ratio,
-        conv_kernel_size=args.conv_kernel,
-    ).to(device)
+    model = build_model(vars(args), meta["vocab_size"]).to(device)
     if args.full_grad:
         model.burn_in_no_grad = False
 

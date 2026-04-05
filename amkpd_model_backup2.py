@@ -53,25 +53,26 @@ def rms_norm(hidden_states: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
 
 
 # ============================================================
-# RoPE (Rotary Positional Embedding) — URM layers.py 이식
+# RoPE (Rotary Positional Embedding)
 # ============================================================
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings, base=10000.0):
+    def __init__(self, dim, max_position_embeddings=81, base=10000.0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
+        self.max_seq_len_cached = max_position_embeddings
+        t = torch.arange(self.max_seq_len_cached).type_as(self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos()[None, :, :])
+        self.register_buffer("sin_cached", emb.sin()[None, :, :])
 
-    def forward(self):
-        return self.cos_cached, self.sin_cached
-
-
-CosSin = tuple[torch.Tensor, torch.Tensor]
-
+    def forward(self, seq_len=81):
+        return (
+            self.cos_cached[:, :seq_len, ...],
+            self.sin_cached[:, :seq_len, ...]
+        )
 
 @dataclass
 class AMKPDCarry:
@@ -83,20 +84,12 @@ class AMKPDCarry:
     current_labels: torch.Tensor   # [B, N] long — 저장된 정답 라벨
 
 
-def rotate_half(x: torch.Tensor):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+def rotate_half(x):
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """URM과 동일한 RoPE 적용. q, k: [B, N, H, d_h], cos, sin: [N, d_h]"""
-    orig_dtype = q.dtype
-    q = q.to(cos.dtype)
-    k = k.to(cos.dtype)
-    q_embed = (q * cos.unsqueeze(-2)) + (rotate_half(q) * sin.unsqueeze(-2))
-    k_embed = (k * cos.unsqueeze(-2)) + (rotate_half(k) * sin.unsqueeze(-2))
-    return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
+def apply_rotary_pos_emb(q, cos, sin):
+    return (q * cos) + (rotate_half(q) * sin)
 
 
 # ============================================================
@@ -185,11 +178,10 @@ class AMK_Block(nn.Module):
         return v.item() if isinstance(v, torch.Tensor) else v
 
     # ----------------------------------------------------------
-    def forward(self, Q_in: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+    def forward(self, Q_in: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            Q_in    : [B, N, d]  현재 은닉 상태 (입력 주입은 L_cycle 레벨에서 수행)
-            cos_sin : (cos, sin) RoPE 캐시 — 각각 [N, d_h]
+            Q_in : [B, N, d]  현재 은닉 상태 (입력 주입은 L_cycle 레벨에서 수행)
         Returns:
             Q_out: [B, N, d]  업데이트된 은닉 상태
         """
@@ -202,26 +194,23 @@ class AMK_Block(nn.Module):
         # ══════════════════════════════════════════════════════
 
         qkv = self.W_QKV(Q_in).view(B, N, 3, H, d_h)
-        Q_pre = qkv[:, :, 0]   # [B, N, H, d_h]
-        K_pre = qkv[:, :, 1]   # [B, N, H, d_h]
-
-        # ══════════════════════════════════════════════════════
-        # Step 2: RoPE 적용 (내적 이전, Q/K 벡터에 회전)
-        # ══════════════════════════════════════════════════════
-
-        cos, sin = cos_sin
-        Q_pre, K_pre = apply_rotary_pos_emb(Q_pre, K_pre, cos, sin)
-
-        Q_proj = Q_pre.transpose(1, 2)  # [B, H, N, d_h]
-        K_proj = K_pre.transpose(1, 2)  # [B, H, N, d_h]
+        Q_proj = qkv[:, :, 0].transpose(1, 2)  # [B, H, N, d_h]
+        K_proj = qkv[:, :, 1].transpose(1, 2)  # [B, H, N, d_h]
         V_proj = qkv[:, :, 2].transpose(1, 2)  # [B, H, N, d_h]
 
         # ══════════════════════════════════════════════════════
-        # Step 3: 헤드별 다항식 인력 행렬 (RoPE 인코딩된 내적 → ReLU^p)
+        # Step 3: 헤드별 비대칭 Bochner 매핑 (ELU+1 양수 보장)
+        # ══════════════════════════════════════════════════════
+
+        Phi_Q = F.elu(Q_proj) + 1.0  # [B, H, N, d_h]
+        Phi_K = F.elu(K_proj) + 1.0  # [B, H, N, d_h]
+
+        # ══════════════════════════════════════════════════════
+        # Step 4: 헤드별 다항식 인력 행렬
         # ══════════════════════════════════════════════════════
 
         scale = self.head_dim ** -0.5
-        W = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale  # [B, H, N, N]
+        W = torch.matmul(Phi_Q, Phi_K.transpose(-1, -2)) * scale  # [B, H, N, N]
         W = F.relu(W)
         if self.kernel_power == 2:
             W = W * W
@@ -339,15 +328,10 @@ class AMKPDModel(nn.Module):
         self.L_cycles   = L_cycles     # 내부 루프
         self.burn_in_no_grad = True    # H_cycles-1 burn-in 시 no_grad 사용 여부
 
-        # ── 토큰 임베딩 (URM: √d 스케일링) ────────────────────────────
+        # ── 토큰 임베딩 (URM: √d 스케일링, input_norm 없음) ─────────────
         self.embed_scale = math.sqrt(d_model)
         self.embedding   = nn.Embedding(vocab_size, d_model)
-
-        # ── RoPE (URM과 동일, additive pos_emb 대체) ─────────────────
-        self.rotary_emb = RotaryEmbedding(
-            dim=d_model // num_heads,
-            max_position_embeddings=8192,
-        )
+        self.pos_emb     = nn.Embedding(8192, d_model)
 
         # ── Carry 리셋용 초기 벡터 (URM urm.py:101-104) ──────────────
         self.register_buffer(
@@ -391,6 +375,7 @@ class AMKPDModel(nn.Module):
 
         # 임베딩 / LM head
         trunc_normal_init_(self.embedding.weight, std=embed_std)
+        trunc_normal_init_(self.pos_emb.weight, std=embed_std)
         trunc_normal_init_(self.lm_head.weight, std=1.0 / math.sqrt(d))
 
         # Q head: weight=0, bias=-5 (URM urm.py:107-108)
@@ -441,10 +426,10 @@ class AMKPDModel(nn.Module):
         return replace(carry, current_hidden=new_hidden)
 
     # ----------------------------------------------------------
-    def _run_blocks(self, Q: torch.Tensor, cos_sin: CosSin) -> torch.Tensor:
+    def _run_blocks(self, Q: torch.Tensor) -> torch.Tensor:
         """K개 블록 순차 통과 = 1 L_cycle의 블록 체인"""
         for block in self.blocks:
-            Q = block(Q, cos_sin)
+            Q = block(Q)
         return Q
 
     # ----------------------------------------------------------
@@ -479,9 +464,8 @@ class AMKPDModel(nn.Module):
 
         # ── Step B: 입력 임베딩 (current_inputs 기준) ─────────────────
         seq_len = new_inputs.shape[1]
-        X = self.embed_scale * self.embedding(new_inputs)  # [B, N, d]
-        cos, sin = self.rotary_emb()           # 각각 [max_seq, d_h]
-        cos_sin = (cos[:seq_len], sin[:seq_len])  # [N, d_h]로 슬라이싱
+        pos = torch.arange(seq_len, device=new_inputs.device).unsqueeze(0)
+        X = self.embed_scale * (self.embedding(new_inputs) + self.pos_emb(pos))  # [B, N, d]
 
         Q = new_carry.current_hidden  # [B, N, d]
 
@@ -493,7 +477,7 @@ class AMKPDModel(nn.Module):
                 for _h in range(self.H_cycles - 1):
                     for _l in range(self.L_cycles):
                         Q = Q + X                     # L_cycle 시작 시 입력 주입
-                        Q = self._run_blocks(Q, cos_sin)
+                        Q = self._run_blocks(Q)
 
         # 마지막 1 H_cycle: gradient 추적 (URM urm.py:159-162)
         if self.log_viz:
@@ -505,7 +489,7 @@ class AMKPDModel(nn.Module):
 
         for _l in range(self.L_cycles):
             Q = Q + X                             # L_cycle 시작 시 입력 주입
-            Q = self._run_blocks(Q, cos_sin)
+            Q = self._run_blocks(Q)
 
             if self.log_viz:
                 self.viz_Q.append(Q.detach())

@@ -1,6 +1,9 @@
 """
-체크포인트 로드 후 훈련/테스트 데이터셋에 대해 평가하는 스크립트.
-가중치 저장이 제대로 되었는지 검증용.
+체크포인트 로드 후 테스트 데이터셋 전체에 대해 평가하는 스크립트.
+
+사용 예시:
+  uv run python eval_checkpoint.py --checkpoint checkpoints/best.pt
+  uv run python eval_checkpoint.py --checkpoint checkpoints/best.pt --max_samples 0  # 전체 평가
 """
 import argparse
 import torch
@@ -8,7 +11,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from dataset import create_dataloaders
-from amkpd_model import AMKPDModel
+from train import build_model
 
 
 def compute_metrics(logits, labels):
@@ -23,23 +26,21 @@ def compute_metrics(logits, labels):
 
 
 @torch.no_grad()
-def evaluate_dataset(model, loader, loops, device, max_samples=None, desc="eval"):
+def evaluate_dataset(model, loader, loops, device, max_samples=0, desc="eval"):
     model.eval()
     total_loss = 0.0
     token_correct = 0.0
     token_total = 0.0
     puzzle_correct = 0.0
     puzzle_total = 0
-    count = 0
 
     for inputs, labels in tqdm(loader, desc=desc, leave=False):
-        if max_samples and count >= max_samples:
+        if max_samples > 0 and puzzle_total >= max_samples:
             break
         inputs = inputs.to(device)
         labels = labels.to(device)
         B = inputs.shape[0]
         seq_len = inputs.shape[1]
-        count += B
 
         carry = model.initial_carry(B, seq_len, device)
         batch = (inputs, labels)
@@ -61,7 +62,7 @@ def evaluate_dataset(model, loader, loops, device, max_samples=None, desc="eval"
         puzzle_correct += m["puzzle_acc"] * B
         puzzle_total += B
 
-    n_batches = max(1, puzzle_total // B) if puzzle_total > 0 else 1
+    n_batches = max(1, puzzle_total // max(1, B))
     return {
         "loss": total_loss / n_batches,
         "token_acc": token_correct / max(1.0, token_total),
@@ -73,8 +74,10 @@ def evaluate_dataset(model, loader, loops, device, max_samples=None, desc="eval"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--data_dir", type=str, default="data/sudoku")
-    parser.add_argument("--max_samples", type=int, default=500)
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="데이터셋 경로 (미지정 시 체크포인트의 data_dir 사용)")
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="최대 평가 샘플 수 (0 = 전체)")
     parser.add_argument("--batch_size", type=int, default=64)
     args = parser.parse_args()
 
@@ -86,38 +89,27 @@ def main():
 
     print(f"Checkpoint: {args.checkpoint}")
     print(f"  step={ckpt['global_step']}, best_puzzle_acc={ckpt['best_puzzle_acc']:.4f}")
-    print(f"  model args: d_model={ckpt_args['d_model']}, num_heads={ckpt_args['num_heads']}, "
+    print(f"  d_model={ckpt_args['d_model']}, num_heads={ckpt_args['num_heads']}, "
           f"num_layers={ckpt_args['num_layers']}, loops={ckpt_args['loops']}")
 
     # 데이터 로드
+    data_dir = args.data_dir or ckpt_args.get("data_dir", "data/sudoku")
     train_loader, test_loader, meta = create_dataloaders(
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         batch_size=args.batch_size,
         num_workers=0,
     )
 
-    # 모델 생성 + 가중치 로드
-    model = AMKPDModel(
-        vocab_size=meta["vocab_size"],
-        d_model=ckpt_args["d_model"],
-        num_heads=ckpt_args["num_heads"],
-        num_layers=ckpt_args["num_layers"],
-        loops=ckpt_args["loops"],
-        H_cycles=ckpt_args.get("H_cycles", 2),
-        L_cycles=ckpt_args.get("L_cycles", 1),
-        kernel_power=ckpt_args.get("kernel_power", 2),
-        expansion_ratio=ckpt_args.get("expansion_ratio", 4),
-        conv_kernel_size=ckpt_args.get("conv_kernel_size", 2),
-    ).to(device)
-
+    # 모델 생성 (train.py의 build_model 재사용) + 가중치 로드
+    model = build_model(ckpt_args, meta["vocab_size"]).to(device)
     model.load_state_dict(ckpt["model"])
-    print(f"  Model loaded successfully. Params: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
     loops = ckpt_args["loops"]
 
     # 훈련 데이터로 평가
     print(f"\n{'='*60}")
-    print(f"[TRAIN set] loops={loops}, max_samples={args.max_samples}")
+    print(f"[TRAIN set] loops={loops}")
     print(f"{'='*60}")
     train_res = evaluate_dataset(model, train_loader, loops, device,
                                   max_samples=args.max_samples, desc="train eval")
@@ -128,7 +120,7 @@ def main():
 
     # 테스트 데이터로 평가
     print(f"\n{'='*60}")
-    print(f"[TEST set] loops={loops}, max_samples={args.max_samples}")
+    print(f"[TEST set] loops={loops}")
     print(f"{'='*60}")
     test_res = evaluate_dataset(model, test_loader, loops, device,
                                  max_samples=args.max_samples, desc="test eval")
@@ -141,15 +133,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"[COMPARISON]")
     print(f"{'='*60}")
-    print(f"  Train loss: {train_res['loss']:.4f}  vs  Test loss: {test_res['loss']:.4f}")
     print(f"  Train pacc: {train_res['puzzle_acc']*100:.2f}%  vs  Test pacc: {test_res['puzzle_acc']*100:.2f}%")
-    gap = train_res['loss'] - test_res['loss']
-    if abs(gap) < 0.1:
-        print(f"  → 차이 미미 ({gap:+.4f}) — 가중치 저장/로드 정상, 과적합 아님")
-    elif train_res['loss'] < test_res['loss']:
-        print(f"  → Train이 더 낮음 ({gap:+.4f}) — 과적합 가능성")
-    else:
-        print(f"  → Test가 더 낮음 ({gap:+.4f}) — 비정상적, 데이터 확인 필요")
 
 
 if __name__ == "__main__":

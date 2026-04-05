@@ -273,7 +273,7 @@ def evaluate(
                 carry, logits, q_logits = model(carry, batch)
 
         _, loss_log = compute_loss(logits, q_logits, carry.current_labels, args)
-        total_loss += loss_log["loss"]
+        total_loss += loss_log["main_loss"]
 
         m = compute_metrics(logits, carry.current_labels)
         mask = carry.current_labels != 0
