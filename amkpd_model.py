@@ -162,9 +162,6 @@ class AMK_Block(nn.Module):
         # 최종 투영: inner_dim → d
         self.W_down = nn.Linear(inner_dim, d_model, bias=False)
 
-        # ── 어텐션 스코어 편향 (inhomogeneous polynomial kernel) ─────────
-        self.attn_bias = nn.Parameter(torch.zeros(num_heads, 1, 1))
-
         # ── 정규화: 파라미터 없는 rms_norm (URM과 동일) ──────────────────
 
         # ── 시각화용 텔레메트리 (Visualization Telemetry) ────────────────
@@ -224,12 +221,19 @@ class AMK_Block(nn.Module):
         K_proj = rms_norm(K_proj)
 
         # ══════════════════════════════════════════════════════
-        # Step 3: 헤드별 다항식 인력 행렬 (RoPE 인코딩된 내적 → ReLU^p)
+        # Step 3: 헤드별 다항식 인력 행렬 (RoPE 내적 스칼라 → ELU+1 → power)
+        #
+        # ReLU 대신 ELU+1을 내적 스칼라에 적용:
+        #   S_ij = Q_i · K_j / √d_h  (음수 가능, RoPE 상대위치 포함)
+        #   W_ij = (ELU(S_ij) + 1)^p  (항상 > 0, 단조 변환으로 RoPE 정보 보존)
+        #
+        # backup2의 ELU+1은 벡터에 적용 후 내적 → RoPE와 양립 불가
+        # 스칼라에 적용하면 RoPE 상대위치 순서 구조를 보존하면서 dense W 보장
         # ══════════════════════════════════════════════════════
 
         scale = self.head_dim ** -0.5
-        W = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale + self.attn_bias  # [B, H, N, N]
-        W = F.relu(W)
+        S = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale  # [B, H, N, N]
+        W = F.elu(S) + 1.0  # 항상 > 0, dense W 보장
         if self.kernel_power == 2:
             W = W * W
         elif self.kernel_power == 4:
