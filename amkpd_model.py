@@ -1,12 +1,18 @@
 """
-AMK-PD: Asymmetric Mapped Kernel Particle Dynamics
+AMK-PD: Asymmetric Mean-shift Kernel Particle Dynamics
 PyTorch 구현
 
 아키텍처 개요 (URM 3중 루프 + Carry 구조):
 - 외부 루프(loops): carry를 유지하며 반복 호출. 샘플별 adaptive halting.
 - 중간 루프(H_cycles): H-1회 no_grad burn-in + 마지막 1회 gradient 추적.
-- 내부 루프(L_cycles): K개 블록 순차 통과. X는 각 블록 내부 정보 공간(H_context)에 주입.
+- 내부 루프(L_cycles): K개 블록 순차 통과. X는 각 L_cycle 시작 시 주입.
 - Markovian gradient isolation: forward 1회의 gradient depth = L_cycles × K.
+
+어텐션 설계:
+- P = softmax(QK^T/√d_h): 마르코프 전이 행렬 (행합=1, L_rw = I - P)
+- C = PV: 가중 평균 중심 (Mean Shift centroid)
+- m = C - V = -L_rw V: 그래프 라플라시안 확산 벡터 (입자 인력 방향)
+- 반복 루프 = 이산 그래프 확산 → 클러스터 수렴
 """
 
 import math
@@ -107,34 +113,33 @@ class AMK_Block(nn.Module):
     """
     AMK_Block (Micro-Layer)
 
-    은닉 상태 Q_in 과 초기 상태 X 를 입력받아
-    4단계 연산(스펙트럼 생성 → 보흐너 사영 → 중력 응집 → ConvSwiGLU)을 거쳐
-    업데이트된 Q_out 을 반환합니다.
+    Softmax Mean Shift + ConvSwiGLU 구조.
+
+    어텐션:
+        P  = softmax(QK^T / √d_h)   — 마르코프 전이 행렬
+        C  = P V                     — 가중 평균 중심
+        m  = C - V = -L_rw V        — 그래프 라플라시안 확산 (인력 방향)
 
     Args:
         d_model        (int)  : 은닉 차원 d
-        num_heads      (int)  : 멀티헤드 어텐션 헤드 수
-        dt             (float): Explicit Euler 스텝 사이즈 초기값 (학습 가능)
-        expansion_ratio(int)  : ConvSwiGLU 내부 팽창 비율 m
+        num_heads      (int)  : 어텐션 헤드 수
+        expansion_ratio(int)  : ConvSwiGLU 팽창 비율
         conv_kernel_size(int) : Depthwise Conv1D 커널 크기
-        kernel_power   (int)  : 인력 행렬 다항식 거듭제곱 차수 (1=선형, 2=이차, 3=삼차)
     """
 
     def __init__(
         self,
         d_model: int,
         num_heads: int = 8,
-        dt: float = 0.5,
+        dt: float = 0.5,          # 미사용, 하위 호환용
         expansion_ratio: int = 4,
         conv_kernel_size: int = 3,
-        kernel_power: int = 2,
     ):
         super().__init__()
-        self.d_model = d_model          # d
+        self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-        self.kernel_power = kernel_power
         # URM과 동일한 intermediate 크기: round(expansion * d * 2/3), 256 정렬
         inner_dim = (-(round(expansion_ratio * d_model * 2 / 3) // -256)) * 256
 
@@ -193,21 +198,17 @@ class AMK_Block(nn.Module):
         Returns:
             Q_out: [B, N, d]  업데이트된 은닉 상태
         """
-        B, N, d = Q_in.shape        # Batch, Seq_len, Dim
+        B, N, d = Q_in.shape
         H = self.num_heads
         d_h = self.head_dim
 
         # ══════════════════════════════════════════════════════
-        # Step 1: 멀티헤드 선형 사영 + 헤드 분할 (fused QKV)
+        # Step 1: QKV 사영 + RoPE + QK-RMSNorm
         # ══════════════════════════════════════════════════════
 
         qkv = self.W_QKV(Q_in).view(B, N, 3, H, d_h)
         Q_pre = qkv[:, :, 0]   # [B, N, H, d_h]
         K_pre = qkv[:, :, 1]   # [B, N, H, d_h]
-
-        # ══════════════════════════════════════════════════════
-        # Step 2: RoPE 적용 (내적 이전, Q/K 벡터에 회전)
-        # ══════════════════════════════════════════════════════
 
         cos, sin = cos_sin
         Q_pre, K_pre = apply_rotary_pos_emb(Q_pre, K_pre, cos, sin)
@@ -216,64 +217,46 @@ class AMK_Block(nn.Module):
         K_proj = K_pre.transpose(1, 2)  # [B, H, N, d_h]
         V_proj = qkv[:, :, 2].transpose(1, 2)  # [B, H, N, d_h]
 
-        # RoPE 적용 이후, 내적 직전에 RMSNorm 추가
+        # QK-RMSNorm: Q/K 노름 고정 → attention collapse 방지
+        # V는 정규화하지 않음 — m = C - V의 크기 정보 보존
         Q_proj = rms_norm(Q_proj)
         K_proj = rms_norm(K_proj)
 
         # ══════════════════════════════════════════════════════
-        # Step 3: 헤드별 다항식 인력 행렬 (RoPE 내적 스칼라 → ELU+1 → power)
-        #
-        # ReLU 대신 ELU+1을 내적 스칼라에 적용:
-        #   S_ij = Q_i · K_j / √d_h  (음수 가능, RoPE 상대위치 포함)
-        #   W_ij = (ELU(S_ij) + 1)^p  (항상 > 0, 단조 변환으로 RoPE 정보 보존)
-        #
-        # backup2의 ELU+1은 벡터에 적용 후 내적 → RoPE와 양립 불가
-        # 스칼라에 적용하면 RoPE 상대위치 순서 구조를 보존하면서 dense W 보장
+        # Step 2: Softmax Mean Shift
+        #   P = softmax(QK^T / √d_h)  — 마르코프 전이 행렬
+        #   C = PV                     — 가중 평균 중심
+        #   m = C - V = -L_rw V       — 그래프 라플라시안 확산 벡터
         # ══════════════════════════════════════════════════════
 
-        scale = self.head_dim ** -0.5
-        S = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale  # [B, H, N, N]
-        W = F.elu(S) + 1.0  # 항상 > 0, dense W 보장
-        if self.kernel_power == 2:
-            W = W * W
-        elif self.kernel_power == 4:
-            W = W * W; W = W * W
-        elif self.kernel_power != 1:
-            W = W ** self.kernel_power
+        C = F.scaled_dot_product_attention(Q_proj, K_proj, V_proj, is_causal=False)
+        m = C - V_proj  # [B, H, N, d_h]
 
         # ══════════════════════════════════════════════════════
-        # Step 5: 헤드별 Mean Shift
+        # Step 3: 헤드 병합 + 출력 사영
         # ══════════════════════════════════════════════════════
 
-        Attraction = torch.matmul(W, V_proj)               # [B, H, N, d_h]
-        Norm = W.sum(dim=-1, keepdim=True) + 1e-6            # [B, H, N, 1]
-        C = Attraction / Norm                               # [B, H, N, d_h]
-        m = C - V_proj                                      # [B, H, N, d_h]
+        m_concat = m.transpose(1, 2).contiguous().view(B, N, d)  # [B, N, d]
+        m_proj = self.W_O_aux(m_concat)                           # [B, N, d]
 
-        # ══════════════════════════════════════════════════════
-        # Step 6: 헤드 병합 + 출력 사영 (W_O zero-init)
-        # ══════════════════════════════════════════════════════
-
-        m_concat = m.transpose(1, 2).contiguous().view(B, N, d)           # [B, N, d]
-        m_proj = self.W_O_aux(m_concat)                                    # [B, N, d]
-
-        # graph break 방지: .item() 없이 텐서로 저장
         self._last_m_norm = m_concat.detach().norm(dim=-1).mean()
         self._last_C_norm = C.detach().transpose(1, 2).contiguous().view(B, N, d).norm(dim=-1).mean()
 
         # ══════════════════════════════════════════════════════
-        # Step 7: 잔차 + Post-Addition Norm (분산 팽창 억제)
+        # Step 4: 잔차 + Post-Addition Norm
         # ══════════════════════════════════════════════════════
 
         Q_interact = rms_norm(Q_in + m_proj)  # [B, N, d]
 
-        # ── 시각화 캐싱 (헤드별 데이터 저장) ────────────────────────────────
+        # ── 시각화 캐싱 ───────────────────────────────────────────────────
         if self.log_viz:
-            # 헤드별 정규화된 인력 행렬: [B, H, N, N]
-            W_norm = W / (W.sum(dim=-1, keepdim=True) + 1e-6)
-            self.viz_W.append(W_norm.detach())             # [B, H, N, N]
-            self.viz_m.append(m.detach())                  # [B, H, N, d_h] (헤드별)
-            self.viz_H.append(Q_in.detach())               # [B, N, d]
+            scale = d_h ** -0.5
+            attn_w = F.softmax(
+                torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale, dim=-1
+            )
+            self.viz_W.append(attn_w.detach())   # [B, H, N, N]
+            self.viz_m.append(m.detach())         # [B, H, N, d_h]
+            self.viz_H.append(Q_in.detach())      # [B, N, d]
             
         # ══════════════════════════════════════════════════════
         # Step 4: ConvSwiGLU with Micro-Residual
@@ -322,8 +305,6 @@ class AMKPDModel(nn.Module):
         loops          (int)  : 외부 루프 최대 횟수 (carry 재호출 횟수)
         H_cycles       (int)  : 중간 루프 횟수 (H-1회 no_grad + 1회 grad)
         L_cycles       (int)  : 내부 루프 횟수 (X 주입 + 블록 통과)
-        dt             (float): Euler 스텝 초기값 (각 블록이 독립적으로 학습)
-        kernel_power   (int)  : 인력 행렬 다항식 거듭제곱 차수
         expansion_ratio(int)  : ConvSwiGLU 팽창 비율
         conv_kernel_size(int) : Depthwise Conv 커널 크기
     """
@@ -337,10 +318,10 @@ class AMKPDModel(nn.Module):
         loops: int = 6,
         H_cycles: int = 2,
         L_cycles: int = 1,
-        dt: float = 0.5,
-        kernel_power: int = 2,
+        dt: float = 0.5,           # 미사용, 하위 호환용
         expansion_ratio: int = 4,
         conv_kernel_size: int = 3,
+        **kwargs,                   # 구 체크포인트의 kernel_power 등 무시
     ):
         super().__init__()
         self.d_model    = d_model
@@ -374,7 +355,6 @@ class AMKPDModel(nn.Module):
                 dt=dt,
                 expansion_ratio=expansion_ratio,
                 conv_kernel_size=conv_kernel_size,
-                kernel_power=kernel_power,
             )
             for _ in range(num_layers)
         ])
@@ -572,8 +552,6 @@ if __name__ == "__main__":
     LOOPS           = 6      # 외부 루프
     H_CYCLES        = 2      # 중간 루프 (1회 no_grad + 1회 grad)
     L_CYCLES        = 1      # 내부 루프
-    DT              = 0.1
-    KERNEL_POWER    = 2
     EXPANSION_RATIO = 4
     CONV_KERNEL     = 3
 
@@ -592,8 +570,6 @@ if __name__ == "__main__":
         loops            = LOOPS,
         H_cycles         = H_CYCLES,
         L_cycles         = L_CYCLES,
-        dt               = DT,
-        kernel_power     = KERNEL_POWER,
         expansion_ratio  = EXPANSION_RATIO,
         conv_kernel_size = CONV_KERNEL,
     ).to(device)

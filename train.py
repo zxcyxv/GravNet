@@ -46,7 +46,6 @@ def build_model(args_dict: dict, vocab_size: int) -> AMKPDModel:
         H_cycles=args_dict.get("H_cycles", 2),
         L_cycles=args_dict.get("L_cycles", 1),
         dt=args_dict.get("dt", 1.0),
-        kernel_power=args_dict.get("kernel_power", 2),
         expansion_ratio=args_dict.get("expansion_ratio", 4),
         conv_kernel_size=args_dict.get("conv_kernel", 2),
     )
@@ -82,7 +81,6 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--dt",              type=float, default=1.0,  help="Euler 스텝 초기값")
     g.add_argument("--expansion_ratio", type=int,   default=4,    help="ConvSwiGLU 팽창 비율")
     g.add_argument("--conv_kernel",     type=int,   default=2,    help="Depthwise conv 커널 크기")
-    g.add_argument("--kernel_power",    type=int,   default=4,    help="인력 행렬 다항식 거듭제곱 차수")
     g.add_argument("--full_grad",       action="store_true",      help="H_cycles burn-in에서 no_grad 끄기")
 
     # ── 훈련 (URM defaults) ──────────────────────────────────────────────
