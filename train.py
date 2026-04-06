@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     # ── 로깅 & 체크포인팅 ─────────────────────────────────────────────────
     g = p.add_argument_group("Logging")
     g.add_argument("--checkpoint_dir", default="checkpoints")
-    g.add_argument("--log_interval",   type=int, default=50,
+    g.add_argument("--log_interval",   type=int, default=250,
                    help="상세 로그 출력 주기 (옵티마이저 스텝)")
     g.add_argument("--eval_steps",     type=int, default=5000,
                    help="스텝 단위 평가 주기 (iter 중간에도 eval)")

@@ -162,6 +162,9 @@ class AMK_Block(nn.Module):
         # 최종 투영: inner_dim → d
         self.W_down = nn.Linear(inner_dim, d_model, bias=False)
 
+        # ── 어텐션 스코어 편향 (inhomogeneous polynomial kernel) ─────────
+        self.attn_bias = nn.Parameter(torch.zeros(num_heads, 1, 1))
+
         # ── 정규화: 파라미터 없는 rms_norm (URM과 동일) ──────────────────
 
         # ── 시각화용 텔레메트리 (Visualization Telemetry) ────────────────
@@ -216,12 +219,16 @@ class AMK_Block(nn.Module):
         K_proj = K_pre.transpose(1, 2)  # [B, H, N, d_h]
         V_proj = qkv[:, :, 2].transpose(1, 2)  # [B, H, N, d_h]
 
+        # RoPE 적용 이후, 내적 직전에 RMSNorm 추가
+        Q_proj = rms_norm(Q_proj)
+        K_proj = rms_norm(K_proj)
+
         # ══════════════════════════════════════════════════════
         # Step 3: 헤드별 다항식 인력 행렬 (RoPE 인코딩된 내적 → ReLU^p)
         # ══════════════════════════════════════════════════════
 
         scale = self.head_dim ** -0.5
-        W = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale  # [B, H, N, N]
+        W = torch.matmul(Q_proj, K_proj.transpose(-1, -2)) * scale + self.attn_bias  # [B, H, N, N]
         W = F.relu(W)
         if self.kernel_power == 2:
             W = W * W
