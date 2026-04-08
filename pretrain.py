@@ -135,6 +135,8 @@ class PretrainConfig(pydantic.BaseModel):
 
     use_muon: bool = False
 
+    eval_max_batches: int = 150
+
 
 
 @dataclass
@@ -230,7 +232,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             ),
             AdamATan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=1e-10,  # Placeholder, overwritten by scheduler each step
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2),
             ),
@@ -639,8 +641,10 @@ def evaluate(
         
         for set_name, batch, global_batch_size in eval_loader:
             processed_batches += 1
+            if config.eval_max_batches > 0 and processed_batches > config.eval_max_batches:
+                break
             if rank == 0:
-                print(f"Processing batch {processed_batches}: {set_name}")
+                print(f"Processing batch {processed_batches}/{config.eval_max_batches}: {set_name}")
             
             # To device
             batch = {k: v.cuda() for k, v in batch.items()}
@@ -759,7 +763,8 @@ def save_code_and_config(config: PretrainConfig, save_dir: str):
     cfg_path = os.path.join(save_dir, "config.yaml")
     json_path = os.path.join(save_dir, "config.json")
 
-    config_dict = json.loads(config.model_dump_json())
+    from omegaconf import OmegaConf
+    config_dict = json.loads(json.dumps(config.model_dump(), default=str))
 
     try:
         with open(cfg_path, "w", encoding="utf-8") as f:
@@ -900,7 +905,8 @@ def launch(hydra_config: DictConfig):
             settings=wandb.Settings(_disable_stats=True),
         )
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
+        if config.checkpoint_path:
+            save_code_and_config(config, config.checkpoint_path)
 
     # Training Loop
     for _iter_id in range(total_iters):

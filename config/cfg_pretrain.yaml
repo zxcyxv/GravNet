@@ -10,8 +10,7 @@ hydra:
 # Data path
 data_path: data/arc-aug-1000
 
-evaluators:
-  - name: arc@ARC
+evaluators: []
 
 # Hyperparams - Training
 global_batch_size: 768

@@ -121,7 +121,12 @@ class AMKBlock(nn.Module):
         m_out = m.transpose(1, 2).contiguous().view(B, N, d)
         attn_output = self.o_proj(m_out)
 
-        # Post-norm residual (same pattern as URM)
+        # Tangent projection: project m onto the tangent plane of the unit sphere at Q
+        # m_perp = m - <m, Q> * Q  (Q is already on the sphere via post-norm)
+        dot = (attn_output * hidden_states).sum(dim=-1, keepdim=True)
+        attn_output = attn_output - dot * hidden_states
+
+        # Post-norm residual = retraction onto the sphere
         hidden_states = rms_norm(hidden_states + attn_output, variance_epsilon=self.norm_eps)
 
         # ConvSwiGLU MLP (identical to URM)
